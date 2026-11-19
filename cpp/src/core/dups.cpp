@@ -384,7 +384,8 @@ struct DupGroup {
     std::vector<uint64_t> mtimes;
 };
 
-void BuildDupGroups(GroupMap byHash, std::vector<DupGroup>& groups) {
+void BuildDupGroups(GroupMap byHash, std::vector<DupGroup>& groups,
+                    bool verbose = false) {
     std::vector<GroupMap::value_type> candidates;
     candidates.reserve(byHash.size());
     for (auto& entry : byHash) {
@@ -431,6 +432,11 @@ void BuildDupGroups(GroupMap byHash, std::vector<DupGroup>& groups) {
             group.mtimes.push_back(item.mtime);
         }
         Found();
+        if (verbose) {
+            std::fprintf(stderr, "dup: 新增一组, 文件数 %zu, 组大小 %llu 字节\n",
+                         group.files.size(),
+                         static_cast<unsigned long long>(group.size));
+        }
         groups.push_back(std::move(group));
     }
 }
@@ -1579,7 +1585,7 @@ Json ScanDups(const std::optional<std::string>& root,
     const size_t pendingTotal = ssdOnlyStage1.size() + mixedStage1.size();
     if (pendingTotal == 0) {
         std::vector<DupGroup> groups;
-        BuildDupGroups(std::move(readyFinal), groups);
+        BuildDupGroups(std::move(readyFinal), groups, trace);
         SortDupGroups(groups);
         Json out = GroupsToJson(groups);
         WriteTextFile(cachePath, out.dump());
@@ -1640,7 +1646,7 @@ Json ScanDups(const std::optional<std::string>& root,
     mergeFinal(mixedOut.finalItems);
 
     std::vector<DupGroup> groups;
-    BuildDupGroups(std::move(readyFinal), groups);
+    BuildDupGroups(std::move(readyFinal), groups, trace);
     SortDupGroups(groups);
 
     if (trace) {
