@@ -59,12 +59,31 @@ const shownGroups = computed(() => dupGroups.value.slice(0, 300));
 
 const driveOptions = computed(() => (drives.value.length ? drives.value : ["C:\\"]));
 
+/** 每次切换页签自增；异步结果回来时对不上就丢弃，避免旧页签覆盖新页签。 */
+let scopeToken = 0;
+let cancelRequested = false;
+
 function selectScope(scope: DupScope) {
   if (dupScope.value === scope) return;
   dupScope.value = scope;
   dupGroups.value = [];
   dupChecked.clear();
-  if (scope !== "PICK") void scan();
+  dupCachedAt.value = 0;
+  if (scope !== "PICK") void showThenRefresh();
+}
+
+/** 切页签先上缓存，再由后端按 300 秒新鲜度决定是否真的重扫。 */
+async function showThenRefresh() {
+  const token = ++scopeToken;
+  const cached = await fetchCached();
+  if (token !== scopeToken) return;
+  if (cached) applyCached(cached);
+  await scan(token);
+}
+
+async function cancelScan() {
+  cancelRequested = true;
+  await cancelActiveScan("dup");
 }
 
 function toggleDrive(drive: string) {
@@ -91,6 +110,19 @@ function selectDefaults() {
     const keeper = pickKeeper(group);
     for (const path of group.files) if (path !== keeper) dupChecked.add(path);
   }
+}
+
+/** 刷新结果时保留用户已勾选、且新结果里仍然存在的副本；一条都不剩返回 false。 */
+function restoreSelection(groups: DupGroup[], previous: Set<string>): boolean {
+  if (previous.size === 0) return false;
+  dupChecked.clear();
+  for (const group of groups) {
+    const keeper = pickKeeper(group);
+    for (const path of group.files) {
+      if (path !== keeper && previous.has(path)) dupChecked.add(path);
+    }
+  }
+  return dupChecked.size > 0;
 }
 
 function uncheckAll() {
@@ -140,40 +172,50 @@ async function scanArgs(): Promise<DupScanArgs | null> {
   };
 }
 
-async function scan() {
+async function scan(token = ++scopeToken) {
   dupLoading.value = true;
   startScanStatus();
   try {
     const args = await scanArgs();
     if (!args) return;
-    dupGroups.value = await invoke<DupGroup[]>("scan_dups", args);
-    dupCachedAt.value = Math.floor(Date.now() / 1000);
-    selectDefaults();
+    const groups = await invoke<DupGroup[]>("scan_dups", args);
+    // 取消时后端返回空数组，别拿它覆盖已经上屏的缓存结果。
+    const wasCancelled = cancelRequested && groups.length === 0;
+    cancelRequested = false;
+    if (token !== scopeToken) return;
+    if (!wasCancelled) {
+      const previous = new Set(dupChecked);
+      dupGroups.value = groups;
+      dupCachedAt.value = Math.floor(Date.now() / 1000);
+      if (!restoreSelection(groups, previous)) selectDefaults();
+    }
   } catch (error) {
+    if (token !== scopeToken) return;
     dupGroups.value = [];
     dupCachedAt.value = 0;
     toast("扫描失败：" + error);
   } finally {
-    dupLoading.value = false;
+    if (token === scopeToken) dupLoading.value = false;
     stopScanStatus();
   }
 }
 
-/** 打开页面时先显示上次扫描的结果，不触发整盘扫描。 */
-async function loadCached(): Promise<boolean> {
+/** 读取上次扫描结果；没有缓存时返回 null。 */
+async function fetchCached(): Promise<{ groups: DupGroup[]; cached_at: number } | null> {
   try {
     const args = await scanArgs();
-    if (!args) return true;
+    if (!args) return null;
     const cached = await invoke<{ groups: DupGroup[]; cached_at: number }>("dup_cached_result", args);
-    if (dupLoading.value || dupGroups.value.length) return true;
-    if (!cached.cached_at) return false;
-    dupGroups.value = cached.groups;
-    dupCachedAt.value = cached.cached_at;
-    selectDefaults();
-    return true;
+    return cached.cached_at ? cached : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function applyCached(cached: { groups: DupGroup[]; cached_at: number }) {
+  dupGroups.value = cached.groups;
+  dupCachedAt.value = cached.cached_at;
+  selectDefaults();
 }
 
 async function removeSelected() {
@@ -222,7 +264,11 @@ async function removeSelected() {
 
 onMounted(async () => {
   if (dupGroups.value.length || dupLoading.value || dupScope.value === "PICK") return;
-  if (!(await loadCached())) void scan();
+  const token = ++scopeToken;
+  const cached = await fetchCached();
+  if (token !== scopeToken) return;
+  if (cached) applyCached(cached);
+  else void scan(token);
 });
 </script>
 
@@ -237,8 +283,8 @@ onMounted(async () => {
       </template>
     </div>
     <button class="green-btn" @click="removeSelected">一键清理</button>
-    <button v-if="dupLoading" class="gray-btn" @click="cancelActiveScan('dup')">取消扫描</button>
-    <button v-else class="gray-btn" @click="scan">重新扫描</button>
+    <button v-if="dupLoading" class="gray-btn" @click="cancelScan">取消扫描</button>
+    <button v-else class="gray-btn" @click="scan()">重新扫描</button>
   </div>
   <div class="sub">{{ subText }}</div>
 

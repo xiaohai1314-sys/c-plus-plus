@@ -1901,6 +1901,7 @@ std::optional<Snapshot> LoadSnapshot(const std::string& path) {
     }
     const bool isV3 = (std::memcmp(magic, "MFT3", 4) == 0);
     const bool isV4 = (std::memcmp(magic, "MFT4", 4) == 0);
+    // MFT5 的 mid/tail 偏移按 64KB 计算，和当前 256KB 强采样不兼容。
     if (!isV3 && !isV4) {
         return std::nullopt;
     }

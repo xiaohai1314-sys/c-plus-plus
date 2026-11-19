@@ -35,6 +35,22 @@ const char* const kSchema =
     ") WITHOUT ROWID;"
     "CREATE INDEX IF NOT EXISTS idx_hashes_last_seen ON file_hashes(last_seen);";
 
+constexpr int kStrongDigestVersion = 3;
+
+int ReadUserVersion(sqlite3* db) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+        return 0;
+    }
+    int version = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        version = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return version;
+}
+
 class Connection {
 public:
     Connection() = default;
@@ -58,8 +74,19 @@ public:
         sqlite3_exec(db_, "PRAGMA cache_size = -65536;", nullptr, nullptr, nullptr);
         sqlite3_exec(db_, "PRAGMA mmap_size = 268435456;", nullptr, nullptr, nullptr);
         sqlite3_exec(db_, "PRAGMA busy_timeout = 5000;", nullptr, nullptr, nullptr);
-        return sqlite3_exec(db_, kSchema, nullptr, nullptr, nullptr) ==
-               SQLITE_OK;
+        if (sqlite3_exec(db_, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) {
+            return false;
+        }
+        // strong 的采样块长变过（v2 改 64KB，v3 改回 256KB），块长一变摘要就
+        // 不可比，必须整列丢弃。head/sample/full 的定义没变，不用动。
+        if (ReadUserVersion(db_) < kStrongDigestVersion) {
+            const std::string sql =
+                "UPDATE file_hashes SET strong = NULL;"
+                "PRAGMA user_version = " +
+                std::to_string(kStrongDigestVersion) + ";";
+            sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, nullptr);
+        }
+        return true;
     }
 
     sqlite3* get() const { return db_; }
