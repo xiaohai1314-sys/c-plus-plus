@@ -61,7 +61,8 @@ std::vector<std::string> SendChunk(const std::vector<std::string>& paths) {
     operation.wFunc = FO_DELETE;
     operation.pFrom = buffer.data();
     operation.pTo = nullptr;
-    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI;
+    operation.fFlags =
+        FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
     const int code = SHFileOperationW(&operation);
     if (code == 0 && operation.fAnyOperationsAborted == 0) {
         return {};

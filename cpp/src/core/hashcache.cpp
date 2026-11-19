@@ -4,9 +4,11 @@
 #include <windows.h>
 
 #include <filesystem>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "core/timeutil.h"
 #include "util/json.h"
@@ -53,6 +55,9 @@ public:
                             nullptr) != SQLITE_OK) {
             return false;
         }
+        sqlite3_exec(db_, "PRAGMA cache_size = -65536;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "PRAGMA mmap_size = 268435456;", nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "PRAGMA busy_timeout = 5000;", nullptr, nullptr, nullptr);
         return sqlite3_exec(db_, kSchema, nullptr, nullptr, nullptr) ==
                SQLITE_OK;
     }
@@ -87,14 +92,14 @@ private:
 
 void BindPath(sqlite3_stmt* stmt, int index, const std::string& path) {
     sqlite3_bind_text(stmt, index, path.data(),
-                      static_cast<int>(path.size()), SQLITE_TRANSIENT);
+                      static_cast<int>(path.size()), SQLITE_STATIC);
 }
 
 void BindDigest(sqlite3_stmt* stmt, int index,
                 const std::optional<Digest>& digest) {
     if (digest.has_value()) {
         sqlite3_bind_blob(stmt, index, digest->data(),
-                          static_cast<int>(digest->size()), SQLITE_TRANSIENT);
+                          static_cast<int>(digest->size()), SQLITE_STATIC);
     } else {
         sqlite3_bind_null(stmt, index);
     }
@@ -131,21 +136,21 @@ std::optional<std::string> JsonString(const Json& item, const char* key) {
 }
 
 void MigrateLegacy(sqlite3* db) {
-    sqlite3_stmt* countStmt = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM file_hashes", -1,
-                           &countStmt, nullptr) != SQLITE_OK) {
+    const std::string legacyPath = JoinPath(CacheDir(), "hash-cache-v2.json");
+    if (!PathExists(legacyPath)) {
         return;
     }
-    int64_t count = 1;
-    if (sqlite3_step(countStmt) == SQLITE_ROW) {
-        count = sqlite3_column_int64(countStmt, 0);
+    sqlite3_stmt* checkStmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM file_hashes LIMIT 1", -1,
+                           &checkStmt, nullptr) != SQLITE_OK) {
+        return;
     }
-    sqlite3_finalize(countStmt);
-    if (count > 0) {
+    const bool hasRows = (sqlite3_step(checkStmt) == SQLITE_ROW);
+    sqlite3_finalize(checkStmt);
+    if (hasRows) {
         return;
     }
 
-    const std::string legacyPath = JoinPath(CacheDir(), "hash-cache-v2.json");
     FILE* file = nullptr;
     if (_wfopen_s(&file, Utf8ToWide(legacyPath).c_str(), L"rb") != 0 ||
         file == nullptr) {
@@ -340,14 +345,25 @@ HashCache HashCache::LoadForPathsAt(const std::string& dbPath,
     if (!select) {
         return cache;
     }
-    sqlite3_exec(conn.get(), "BEGIN", nullptr, nullptr, nullptr);
+    // 入参按 size 分桶顺序收集，路径在 B-Tree 字典序上完全乱序；
+    // 先对路径排序，把随机点查转化为顺序叶子页访问。
+    std::vector<const std::string*> sortedPaths;
+    sortedPaths.reserve(paths.size());
     for (const std::string& path : paths) {
-        if (cache.entries_.find(path) != cache.entries_.end()) {
+        sortedPaths.push_back(&path);
+    }
+    std::sort(sortedPaths.begin(), sortedPaths.end(),
+              [](const std::string* left, const std::string* right) {
+                  return *left < *right;
+              });
+    sqlite3_exec(conn.get(), "BEGIN", nullptr, nullptr, nullptr);
+    for (const std::string* pathPtr : sortedPaths) {
+        if (cache.entries_.find(*pathPtr) != cache.entries_.end()) {
             continue;
         }
         sqlite3_reset(select.get());
         sqlite3_clear_bindings(select.get());
-        BindPath(select.get(), 1, path);
+        BindPath(select.get(), 1, *pathPtr);
         if (sqlite3_step(select.get()) != SQLITE_ROW) {
             continue;
         }
@@ -359,7 +375,7 @@ HashCache HashCache::LoadForPathsAt(const std::string& dbPath,
         entry.strong = ColumnDigest(select.get(), 4);
         entry.full = ColumnDigest(select.get(), 5);
         entry.lastSeen = NonNegativeColumn(select.get(), 6);
-        cache.entries_[path] = entry;
+        cache.entries_[*pathPtr] = entry;
     }
     sqlite3_exec(conn.get(), "COMMIT", nullptr, nullptr, nullptr);
     return cache;
@@ -445,8 +461,18 @@ void HashCache::SaveDirty() {
     if (!insert) {
         return;
     }
-    sqlite3_exec(conn.get(), "BEGIN", nullptr, nullptr, nullptr);
+    std::vector<const std::string*> sortedDirty;
+    sortedDirty.reserve(dirty_.size());
     for (const std::string& path : dirty_) {
+        sortedDirty.push_back(&path);
+    }
+    std::sort(sortedDirty.begin(), sortedDirty.end(),
+              [](const std::string* left, const std::string* right) {
+                  return *left < *right;
+              });
+    sqlite3_exec(conn.get(), "BEGIN", nullptr, nullptr, nullptr);
+    for (const std::string* pathPtr : sortedDirty) {
+        const std::string& path = *pathPtr;
         const auto found = entries_.find(path);
         if (found == entries_.end()) {
             continue;

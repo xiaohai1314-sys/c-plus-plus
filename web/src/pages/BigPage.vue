@@ -92,12 +92,13 @@ async function removeSelected() {
       paths: rows.map((row) => row.path),
     });
     toast(`移到回收站 ${report.deleted} 个，释放 ${fmtSize(report.freed)}。`);
-    bigChecked.clear();
-    for (const path of report.failed || []) bigChecked.add(path);
+    const failedSet = new Set(report.failed || []);
+    const deletedSet = new Set(rows.map((r) => r.path).filter((p) => !failedSet.has(p)));
+    for (const p of deletedSet) bigChecked.delete(p);
+    bigRows.value = bigRows.value.filter((r) => !deletedSet.has(r.path));
   } catch (error) {
     toast("清理失败：" + error);
   }
-  await scan();
 }
 
 onMounted(() => {

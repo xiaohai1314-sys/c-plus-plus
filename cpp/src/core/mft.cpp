@@ -31,6 +31,7 @@ constexpr uint64_t kRawReadMinAgeSecs = 300;
 constexpr size_t kChunkSize = 8u * 1024 * 1024;
 constexpr size_t kDeltaParallelThreshold = 64;
 constexpr size_t kDeltaParallelThreads = 8;
+constexpr uint64_t kStrongChunkBytes = 256ULL * 1024;
 
 struct Run {
     int64_t vcn = 0;
@@ -147,17 +148,168 @@ std::vector<Run> ParseRunlist(const uint8_t* data, size_t length) {
     return runs;
 }
 
-std::string Utf16Le(const uint8_t* data, size_t length) {
-    std::wstring wide;
-    wide.reserve(length / 2);
-    size_t index = 0;
-    while (index + 1 < length) {
-        wchar_t ch = 0;
-        std::memcpy(&ch, data + index, 2);
-        wide.push_back(ch);
-        index += 2;
+void ParseDataExtents(const uint8_t* data, size_t length,
+                      uint64_t bytesPerCluster, uint64_t fileSize,
+                      uint64_t& firstLcn, uint64_t& firstRunClusters,
+                      bool& hasStrongExtents, uint64_t& midRawOffset,
+                      uint64_t& tailRawOffset) {
+    firstLcn = 0;
+    firstRunClusters = 0;
+    hasStrongExtents = false;
+    midRawOffset = 0;
+    tailRawOffset = 0;
+
+    if (length == 0 || bytesPerCluster == 0) {
+        return;
     }
-    return WideToUtf8(wide);
+
+    const bool needTriple = (fileSize >= kStrongChunkBytes * 3);
+    const uint64_t midTargetStart = fileSize / 2;
+    const uint64_t midTargetEnd = midTargetStart + kStrongChunkBytes;
+    const uint64_t tailTargetStart =
+        needTriple ? (fileSize - kStrongChunkBytes) : 0;
+    const uint64_t tailTargetEnd = fileSize;
+    bool foundMid = false;
+    bool foundTail = false;
+
+    int64_t vcn = 0;
+    int64_t prevLcn = 0;
+    size_t position = 0;
+
+    while (position < length) {
+        const uint8_t header = data[position];
+        ++position;
+        if (header == 0) {
+            break;
+        }
+        const size_t lengthSize = header & 0x0F;
+        const size_t offsetSize = (header >> 4) & 0x0F;
+        if (lengthSize == 0 || lengthSize > 8 || offsetSize > 8 ||
+            position + lengthSize + offsetSize > length) {
+            break;
+        }
+        const int64_t runLength = ReadUintLe(data + position, lengthSize);
+        position += lengthSize;
+        const int64_t delta =
+            offsetSize == 0 ? 0 : ReadIntLe(data + position, offsetSize);
+        position += offsetSize;
+
+        int64_t runLcn = -1;
+        if (offsetSize > 0) {
+            prevLcn += delta;
+            runLcn = prevLcn;
+        }
+
+        if (runLength <= 0) {
+            break;
+        }
+
+        if (vcn == 0) {
+            if (runLcn <= 0) {
+                return;
+            }
+            firstLcn = static_cast<uint64_t>(runLcn);
+            firstRunClusters = static_cast<uint64_t>(runLength);
+            const uint64_t firstBytes = firstRunClusters * bytesPerCluster;
+            if (firstBytes >= fileSize) {
+                if (needTriple) {
+                    const uint64_t baseOffset = firstLcn * bytesPerCluster;
+                    const uint64_t midOff = baseOffset + midTargetStart;
+                    const uint64_t tailOff = baseOffset + tailTargetStart;
+                    if (baseOffset < midOff && midOff < tailOff) {
+                        midRawOffset = midOff;
+                        tailRawOffset = tailOff;
+                        hasStrongExtents = true;
+                    }
+                }
+                return;
+            }
+            if (!needTriple || firstBytes < kStrongChunkBytes) {
+                return;
+            }
+        }
+
+        if (runLcn > 0) {
+            const uint64_t runStartByte =
+                static_cast<uint64_t>(vcn) * bytesPerCluster;
+            const uint64_t runEndByte =
+                (static_cast<uint64_t>(vcn) + static_cast<uint64_t>(runLength)) *
+                bytesPerCluster;
+            const uint64_t runPhysStart =
+                static_cast<uint64_t>(runLcn) * bytesPerCluster;
+            if (!foundMid && midTargetStart >= runStartByte &&
+                midTargetEnd <= runEndByte) {
+                midRawOffset = runPhysStart + (midTargetStart - runStartByte);
+                foundMid = true;
+            }
+            if (!foundTail && tailTargetStart >= runStartByte &&
+                tailTargetEnd <= runEndByte) {
+                tailRawOffset = runPhysStart + (tailTargetStart - runStartByte);
+                foundTail = true;
+            }
+            if (foundMid && foundTail) {
+                break;
+            }
+        }
+
+        vcn += runLength;
+    }
+
+    if (foundMid && foundTail) {
+        const uint64_t headOffset = firstLcn * bytesPerCluster;
+        if (headOffset < midRawOffset && midRawOffset < tailRawOffset) {
+            hasStrongExtents = true;
+            return;
+        }
+    }
+    midRawOffset = 0;
+    tailRawOffset = 0;
+}
+
+std::string Utf16Le(const uint8_t* data, size_t length) {
+    const size_t charCount = length / 2;
+    if (charCount == 0) {
+        return {};
+    }
+    std::string s;
+    s.resize(charCount);
+    bool isAscii = true;
+    for (size_t i = 0; i < charCount; ++i) {
+        const uint8_t c0 = data[2 * i];
+        const uint8_t c1 = data[2 * i + 1];
+        if (c1 != 0 || c0 >= 0x80) {
+            isAscii = false;
+            break;
+        }
+        s[i] = static_cast<char>(c0);
+    }
+    if (isAscii) {
+        return s;
+    }
+    const wchar_t* wptr = nullptr;
+    wchar_t stackBuf[260];
+    std::vector<wchar_t> heapBuf;
+    if ((reinterpret_cast<uintptr_t>(data) & 1) == 0) {
+        wptr = reinterpret_cast<const wchar_t*>(data);
+    } else {
+        if (charCount <= 260) {
+            std::memcpy(stackBuf, data, charCount * 2);
+            wptr = stackBuf;
+        } else {
+            heapBuf.resize(charCount);
+            std::memcpy(heapBuf.data(), data, charCount * 2);
+            wptr = heapBuf.data();
+        }
+    }
+    const int utf8Len = WideCharToMultiByte(
+        CP_UTF8, 0, wptr, static_cast<int>(charCount), nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0) {
+        return {};
+    }
+    s.resize(utf8Len);
+    WideCharToMultiByte(CP_UTF8, 0, wptr, static_cast<int>(charCount),
+                        s.data(), utf8Len, nullptr, nullptr);
+    return s;
 }
 
 struct ParsedRecord {
@@ -176,8 +328,6 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
     if (length < 48 || std::memcmp(record, "FILE", 4) != 0) {
         return result;
     }
-    ApplyFixups(record, length, bytesPerSector);
-
     const uint16_t flags = U16At(record, length, 22);
     if ((flags & 1) == 0) {
         return result;
@@ -185,6 +335,7 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
     if (index != 0 && U64At(record, length, 32) != 0) {
         return result;
     }
+    ApplyFixups(record, length, bytesPerSector);
 
     const bool isDir = (flags & 2) != 0;
     const uint16_t sequence = U16At(record, length, 16);
@@ -197,11 +348,15 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
     size_t nameBytes = 0;
     uint64_t parentFrn = 0;
     uint64_t size = 0;
+    uint64_t initializedSize = 0;
     uint64_t mtime = 0;
     uint32_t attributes = 0;
     uint16_t dataFlags = 0;
     uint64_t firstLcn = 0;
     uint64_t firstRunClusters = 0;
+    bool hasStrongExtents = false;
+    uint64_t midRawOffset = 0;
+    uint64_t tailRawOffset = 0;
     bool hasMftRuns = false;
     std::vector<Run> mftRuns;
 
@@ -258,6 +413,10 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
                 if (position + 56 <= length &&
                     U64At(record, length, position + 16) == 0) {
                     size = U64At(record, length, position + 48);
+                    initializedSize =
+                        (position + 64 <= position + attributeLength)
+                            ? U64At(record, length, position + 56)
+                            : 0;
                     const size_t runOffset =
                         U16At(record, length, position + 32);
                     const size_t start = position + runOffset;
@@ -267,16 +426,17 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
                         if (index == 0) {
                             mftRuns = ParseRunlist(record + start, runBytes);
                             hasMftRuns = true;
-                        } else {
-                            const std::pair<uint64_t, uint64_t> extent =
-                                mft::ParseFirstExtent(record + start, runBytes);
-                            firstLcn = extent.first;
-                            firstRunClusters = extent.second;
+                        } else if (!isDir && size >= minSize) {
+                            ParseDataExtents(
+                                record + start, runBytes, bytesPerCluster, size,
+                                firstLcn, firstRunClusters, hasStrongExtents,
+                                midRawOffset, tailRawOffset);
                         }
                     }
                 }
             } else {
                 size = U32At(record, length, position + 16);
+                initializedSize = size;
             }
         }
 
@@ -310,6 +470,10 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
         return result;
     }
 
+    if (nameBytes >= 2 && record[nameOffset] == '$' && record[nameOffset + 1] == 0) {
+        return result;
+    }
+
     std::string name = Utf16Le(record + nameOffset, nameBytes);
     if (!name.empty() && name.front() == '$') {
         return result;
@@ -320,10 +484,15 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
         0x0000'4000 /* ENCRYPTED */ | mft::kFileAttributeSparseFile;
     const uint64_t firstExtentBytes =
         firstRunClusters * static_cast<uint64_t>(bytesPerCluster);
-    const bool canRawRead = (attributes & kNoRawAttrs) == 0 &&
-                            (dataFlags & (0x0001 | 0x4000 | 0x8000)) == 0 &&
-                            firstLcn > 0 &&
-                            firstExtentBytes >= std::min<uint64_t>(size, 4096);
+    const bool canRawRead =
+        (attributes & kNoRawAttrs) == 0 &&
+        (dataFlags & (0x0001 | 0x4000 | 0x8000)) == 0 && firstLcn > 0 &&
+        firstExtentBytes >= std::min<uint64_t>(size, 4096) &&
+        initializedSize >= std::min<uint64_t>(size, 4096);
+    const bool canRawFull =
+        canRawRead && initializedSize >= size && (firstExtentBytes >= size);
+    const bool canRawStrong =
+        canRawRead && initializedSize >= size && hasStrongExtents;
 
     result.kind = ParsedRecord::Kind::File;
     result.index = index;
@@ -335,6 +504,10 @@ ParsedRecord ParseRecordInPlace(uint8_t* record, size_t length, uint64_t index,
     result.raw.firstLcn = firstLcn;
     result.raw.sortKey = firstLcn > 0 ? firstLcn : index;
     result.raw.canRawRead = canRawRead;
+    result.raw.canRawFull = canRawFull;
+    result.raw.canRawStrong = canRawStrong;
+    result.raw.midRawOffset = canRawStrong ? midRawOffset : 0;
+    result.raw.tailRawOffset = canRawStrong ? tailRawOffset : 0;
     return result;
 }
 
@@ -383,7 +556,7 @@ UsnDelta CollectUsnChangedIndices(HANDLE handle,
     input.BytesToWaitFor = 0;
     input.UsnJournalID = journal.UsnJournalID;
 
-    std::vector<uint8_t> buffer(64 * 1024);
+    std::vector<uint8_t> buffer(1024 * 1024);
     std::unordered_set<uint64_t> changed;
     for (;;) {
         DWORD returned = 0;
@@ -462,6 +635,7 @@ std::vector<DeltaUpdate> ApplyUsnDelta(
     const std::unordered_set<uint64_t>& changedSet, size_t recordSize,
     size_t bytesPerSector, size_t bytesPerCluster, uint64_t minSize) {
     std::vector<uint64_t> changed(changedSet.begin(), changedSet.end());
+    std::sort(changed.begin(), changed.end());
     auto parseOne = [&](HANDLE source, std::vector<uint8_t>& buffer,
                         uint64_t index) -> std::optional<DeltaUpdate> {
         uint64_t actualFrn = 0;
@@ -553,58 +727,126 @@ size_t ParseThreadCount() {
     return std::max<size_t>(1, std::min<size_t>(hardware == 0 ? 4 : hardware, 16));
 }
 
-void ParseChunkParallel(const uint8_t* data, size_t length, uint64_t baseIndex,
-                        size_t recordSize, size_t bytesPerSector,
-                        size_t bytesPerCluster, uint64_t minSize, DirMap& dirs,
-                        FileMap& files) {
-    const size_t count = length / recordSize;
-    if (count == 0) {
-        return;
+class MftWorkerPool {
+public:
+    struct WorkerResults {
+        std::vector<std::pair<uint64_t, mft::DirNode>> dirs;
+        std::vector<std::pair<uint64_t, mft::RawFile>> files;
+    };
+
+    explicit MftWorkerPool(size_t threadCount)
+        : threadCount_(threadCount), doneCount_(0), running_(true), jobEpoch_(0) {
+        results_.resize(threadCount);
+        workers_.reserve(threadCount);
+        for (size_t i = 0; i < threadCount; ++i) {
+            workers_.emplace_back([this, i] { WorkerLoop(i); });
+        }
     }
-    const size_t threads = std::min(ParseThreadCount(), count);
-    std::vector<std::vector<ParsedRecord>> parts(threads);
-    std::atomic<size_t> next{0};
-    std::vector<std::thread> workers;
-    workers.reserve(threads);
-    for (size_t part = 0; part < threads; ++part) {
-        workers.emplace_back([&, part] {
-            std::vector<uint8_t> scratch(recordSize);
-            std::vector<ParsedRecord> local;
-            for (;;) {
-                const size_t slot = next.fetch_add(1);
-                if (slot >= count) {
-                    break;
-                }
-                const uint8_t* raw = data + slot * recordSize;
-                if (std::memcmp(raw, "FILE", 4) != 0) {
-                    continue;
-                }
-                std::memcpy(scratch.data(), raw, recordSize);
-                ParsedRecord parsed =
-                    ParseRecordInPlace(scratch.data(), recordSize,
-                                       baseIndex + slot, bytesPerSector,
-                                       bytesPerCluster, minSize);
-                if (parsed.kind == ParsedRecord::Kind::Dir ||
-                    parsed.kind == ParsedRecord::Kind::File) {
-                    local.push_back(std::move(parsed));
-                }
-            }
-            parts[part] = std::move(local);
-        });
-    }
-    for (std::thread& worker : workers) {
-        worker.join();
-    }
-    for (std::vector<ParsedRecord>& part : parts) {
-        for (ParsedRecord& parsed : part) {
-            if (parsed.kind == ParsedRecord::Kind::Dir) {
-                dirs[parsed.index] = std::move(parsed.node);
-            } else if (parsed.kind == ParsedRecord::Kind::File) {
-                files[parsed.index] = std::move(parsed.raw);
+
+    ~MftWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        cvStart_.notify_all();
+        for (std::thread& t : workers_) {
+            if (t.joinable()) {
+                t.join();
             }
         }
     }
-}
+
+    void ProcessChunk(uint8_t* data, size_t count, uint64_t baseIndex,
+                      size_t recordSize, size_t bytesPerSector,
+                      size_t bytesPerCluster, uint64_t minSize) {
+        if (count == 0) {
+            return;
+        }
+        chunkData_ = data;
+        totalRecords_ = count;
+        baseIndex_ = baseIndex;
+        recordSize_ = recordSize;
+        bytesPerSector_ = bytesPerSector;
+        bytesPerCluster_ = bytesPerCluster;
+        minSize_ = minSize;
+        doneCount_.store(0, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++jobEpoch_;
+        }
+        cvStart_.notify_all();
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        cvDone_.wait(lock, [this] {
+            return doneCount_.load(std::memory_order_acquire) == threadCount_;
+        });
+    }
+
+    std::vector<WorkerResults> results_;
+
+private:
+    void WorkerLoop(size_t workerId) {
+        size_t lastEpoch = 0;
+        WorkerResults& myResult = results_[workerId];
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cvStart_.wait(lock, [this, lastEpoch] {
+                    return !running_ || jobEpoch_ > lastEpoch;
+                });
+                if (!running_) {
+                    break;
+                }
+                lastEpoch = jobEpoch_;
+            }
+
+            const size_t recordsPerThread =
+                (totalRecords_ + threadCount_ - 1) / threadCount_;
+            const size_t startRec = workerId * recordsPerThread;
+            if (startRec < totalRecords_) {
+                const size_t endRec =
+                    std::min(startRec + recordsPerThread, totalRecords_);
+                for (size_t r = startRec; r < endRec; ++r) {
+                    uint8_t* raw = chunkData_ + r * recordSize_;
+                    ParsedRecord parsed = ParseRecordInPlace(
+                        raw, recordSize_, baseIndex_ + r, bytesPerSector_,
+                        bytesPerCluster_, minSize_);
+                    if (parsed.kind == ParsedRecord::Kind::Dir) {
+                        myResult.dirs.emplace_back(parsed.index,
+                                                   std::move(parsed.node));
+                    } else if (parsed.kind == ParsedRecord::Kind::File) {
+                        myResult.files.emplace_back(parsed.index,
+                                                    std::move(parsed.raw));
+                    }
+                }
+            }
+
+            if (doneCount_.fetch_add(1, std::memory_order_release) + 1 ==
+                threadCount_) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                cvDone_.notify_one();
+            }
+        }
+    }
+
+    size_t threadCount_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable cvStart_;
+    std::condition_variable cvDone_;
+    std::atomic<size_t> doneCount_;
+    size_t jobEpoch_ = 0;
+    bool running_ = true;
+
+    uint8_t* chunkData_ = nullptr;
+    size_t totalRecords_ = 0;
+    uint64_t baseIndex_ = 0;
+    size_t recordSize_ = 0;
+    size_t bytesPerSector_ = 0;
+    size_t bytesPerCluster_ = 0;
+    uint64_t minSize_ = 0;
+};
 
 bool FullMftReadParallel(HANDLE handle,
                          const NTFS_VOLUME_DATA_BUFFER& volume,
@@ -618,10 +860,14 @@ bool FullMftReadParallel(HANDLE handle,
             ? static_cast<uint64_t>(volume.MftValidDataLength.QuadPart)
             : UINT64_MAX;
 
-    std::vector<uint8_t> buffer(kChunkSize);
+    constexpr size_t kLargeChunkSize = 16u * 1024 * 1024;
+    std::vector<uint8_t> buffer(kLargeChunkSize);
     std::vector<uint8_t> carry;
     carry.reserve(recordSize);
     uint64_t totalOffset = 0;
+
+    const size_t threadCount = std::min<size_t>(ParseThreadCount(), 8);
+    MftWorkerPool pool(threadCount);
 
     for (const Run& run : runs) {
         if (totalOffset >= maxMftBytes) {
@@ -639,19 +885,20 @@ bool FullMftReadParallel(HANDLE handle,
         }
         const int64_t diskOffset =
             run.lcn * static_cast<int64_t>(bytesPerCluster);
-        const uint64_t toProcess = std::min(runBytes, maxMftBytes - totalOffset);
+        const uint64_t toProcess =
+            std::min(runBytes, maxMftBytes - totalOffset);
         uint64_t doneInRun = 0;
 
         while (doneInRun < toProcess) {
             const size_t want = static_cast<size_t>(
-                std::min<uint64_t>(toProcess - doneInRun, kChunkSize));
+                std::min<uint64_t>(toProcess - doneInRun, kLargeChunkSize));
             const size_t got = ReadExactAt(
                 handle, diskOffset + static_cast<int64_t>(doneInRun),
                 buffer.data(), want);
             if (got == 0) {
                 break;
             }
-            const uint8_t* data = buffer.data();
+            uint8_t* data = buffer.data();
             size_t cursor = 0;
 
             if (!carry.empty()) {
@@ -681,10 +928,10 @@ bool FullMftReadParallel(HANDLE handle,
             const size_t alignedLength =
                 ((got - cursor) / recordSize) * recordSize;
             if (alignedLength > 0) {
-                ParseChunkParallel(data + cursor, alignedLength,
-                                   (totalOffset + cursor) / recordSize,
-                                   recordSize, bytesPerSector, bytesPerCluster,
-                                   storeMinSize, dirs, files);
+                pool.ProcessChunk(data + cursor, alignedLength / recordSize,
+                                  (totalOffset + cursor) / recordSize,
+                                  recordSize, bytesPerSector, bytesPerCluster,
+                                  storeMinSize);
                 cursor += alignedLength;
             }
 
@@ -694,6 +941,23 @@ bool FullMftReadParallel(HANDLE handle,
 
             doneInRun += got;
             totalOffset += got;
+        }
+    }
+
+    size_t totalDirs = dirs.size();
+    size_t totalFiles = files.size();
+    for (const auto& res : pool.results_) {
+        totalDirs += res.dirs.size();
+        totalFiles += res.files.size();
+    }
+    dirs.reserve(totalDirs);
+    files.reserve(totalFiles);
+    for (auto& res : pool.results_) {
+        for (auto& [idx, node] : res.dirs) {
+            dirs[idx] = std::move(node);
+        }
+        for (auto& [idx, raw] : res.files) {
+            files[idx] = std::move(raw);
         }
     }
 
@@ -715,7 +979,7 @@ std::string DriveRootOf(const std::string& root) {
 
 std::string SnapshotPath(uint64_t serial) {
     char name[64];
-    std::snprintf(name, sizeof(name), "mft-v3-%016llx.bin",
+    std::snprintf(name, sizeof(name), "mft-v4-%016llx.bin",
                   static_cast<unsigned long long>(serial));
     return JoinPath(CacheDir(), name);
 }
@@ -960,7 +1224,7 @@ std::pair<uint64_t, uint64_t> ParseFirstExtent(const uint8_t* data,
 }
 
 /// 超过这个数量就认为目录遍历不划算，切回整卷 $MFT。
-constexpr size_t kSubtreeWalkLimit = 200'000;
+constexpr size_t kSubtreeWalkLimit = 10'000;
 
 /// 长路径的 FindFirstFileW 需要 \\?\ 前缀，超过 MAX_PATH 才加，避免影响普通路径。
 std::wstring LongPathForm(const std::wstring& path) {
@@ -995,29 +1259,31 @@ std::vector<FileEntry> FallbackWalkFiles(
     WIN32_FIND_DATAW data;
     const std::wstring wideRoot = Utf8ToWide(root);
     HANDLE handle =
-        FindFirstFileW(LongPathForm(wideRoot + L"\\*").c_str(), &data);
+        FindFirstFileExW(LongPathForm(wideRoot + L"\\*").c_str(),
+                         FindExInfoBasic, &data, FindExSearchNameMatch,
+                         nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (handle == INVALID_HANDLE_VALUE) {
         return out;
     }
     do {
-        const std::wstring name(data.cFileName);
-        if (name.empty() || name == L"." || name == L"..") {
+        if (data.cFileName[0] == L'.' &&
+            (data.cFileName[1] == L'\0' ||
+             (data.cFileName[1] == L'.' && data.cFileName[2] == L'\0'))) {
             continue;
         }
-        if (name.front() == L'$') {
+        if (data.cFileName[0] == L'$') {
             continue;
         }
         if ((data.dwFileAttributes & kSkipFileAttrs) != 0) {
             continue;
         }
-        const std::wstring child = wideRoot + L"\\" + name;
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            const std::string lower = ToLowerAscii(WideToUtf8(name));
+            const std::string lower = ToLowerAscii(WideToUtf8(data.cFileName));
             if (std::find(skipTop.begin(), skipTop.end(), lower) !=
                 skipTop.end()) {
                 continue;
             }
-            tops.push_back(child);
+            tops.push_back(wideRoot + L"\\" + data.cFileName);
         } else {
             const uint64_t size =
                 (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
@@ -1029,7 +1295,7 @@ std::vector<FileEntry> FallbackWalkFiles(
                 break;
             }
             FileEntry entry;
-            entry.path = WideToUtf8(child);
+            entry.path = WideToUtf8(wideRoot + L"\\" + data.cFileName);
             entry.size = size;
             entry.mtime = FileTimeToUnix(
                 (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
@@ -1050,24 +1316,26 @@ std::vector<FileEntry> FallbackWalkFiles(
             stack.pop_back();
             WIN32_FIND_DATAW child;
             HANDLE find =
-                FindFirstFileW(LongPathForm(current + L"\\*").c_str(), &child);
+                FindFirstFileExW(LongPathForm(current + L"\\*").c_str(),
+                                 FindExInfoBasic, &child, FindExSearchNameMatch,
+                                 nullptr, FIND_FIRST_EX_LARGE_FETCH);
             if (find == INVALID_HANDLE_VALUE) {
                 continue;
             }
             do {
-                const std::wstring name(child.cFileName);
-                if (name.empty() || name == L"." || name == L"..") {
+                if (child.cFileName[0] == L'.' &&
+                    (child.cFileName[1] == L'\0' ||
+                     (child.cFileName[1] == L'.' && child.cFileName[2] == L'\0'))) {
                     continue;
                 }
-                if (name.front() == L'$') {
+                if (child.cFileName[0] == L'$') {
                     continue;
                 }
                 if ((child.dwFileAttributes & kSkipFileAttrs) != 0) {
                     continue;
                 }
-                const std::wstring full = current + L"\\" + name;
                 if ((child.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-                    stack.push_back(full);
+                    stack.push_back(current + L"\\" + child.cFileName);
                     continue;
                 }
                 const uint64_t size =
@@ -1080,7 +1348,7 @@ std::vector<FileEntry> FallbackWalkFiles(
                     break;
                 }
                 FileEntry entry;
-                entry.path = WideToUtf8(full);
+                entry.path = WideToUtf8(current + L"\\" + child.cFileName);
                 entry.size = size;
                 entry.mtime = FileTimeToUnix(
                     (static_cast<uint64_t>(child.ftLastWriteTime.dwHighDateTime)
@@ -1129,6 +1397,51 @@ std::vector<FileEntry> FallbackWalkFiles(
     return out;
 }
 
+std::optional<uint64_t> FindSubdirectoryIndex(const DirMap& dirs,
+                                              const std::string& trimmed) {
+    size_t pos = trimmed.find('\\');
+    if (pos == std::string::npos) {
+        return std::nullopt;
+    }
+    std::vector<std::string> parts;
+    while (pos < trimmed.size()) {
+        while (pos < trimmed.size() &&
+               (trimmed[pos] == '\\' || trimmed[pos] == '/')) {
+            ++pos;
+        }
+        if (pos >= trimmed.size()) {
+            break;
+        }
+        size_t nextPos = trimmed.find_first_of("\\/", pos);
+        if (nextPos == std::string::npos) {
+            nextPos = trimmed.size();
+        }
+        parts.push_back(trimmed.substr(pos, nextPos - pos));
+        pos = nextPos;
+    }
+    if (parts.empty()) {
+        return 5;
+    }
+
+    uint64_t currIndex = 5;
+    for (const std::string& part : parts) {
+        bool found = false;
+        for (const auto& [idx, node] : dirs) {
+            if ((node.parentFrn & 0xFFFF'FFFF'FFFFULL) == currIndex) {
+                if (_stricmp(node.name.c_str(), part.c_str()) == 0) {
+                    currIndex = idx;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            return std::nullopt;
+        }
+    }
+    return currIndex;
+}
+
 std::vector<FileEntry> ScanFiles(const std::string& root, uint64_t minSize,
                                  const std::vector<std::string>& skipTop) {
     return ScanFilesWhere(root, minSize, skipTop,
@@ -1143,27 +1456,53 @@ std::vector<FileEntry> ScanFilesWhere(const std::string& root, uint64_t minSize,
     while (!trimmed.empty() && trimmed.back() == '\\') {
         trimmed.pop_back();
     }
+    const std::wstring wideTrimmed = Utf8ToWide(trimmed);
+    wchar_t longBuf[32768];
+    if (GetLongPathNameW(wideTrimmed.c_str(), longBuf, 32768) != 0) {
+        trimmed = WideToUtf8(longBuf);
+        while (!trimmed.empty() && trimmed.back() == '\\') {
+            trimmed.pop_back();
+        }
+    }
     const bool isDriveRoot = trimmed.size() == 2;
-    // 子目录直接走目录遍历：$MFT 要先把整卷枚举一遍再按前缀过滤，为一个小文件夹
-    // 付全盘的代价。只有子树大到超过阈值时才回退到 $MFT。
+    // 子目录优先检查是否已有该卷的 $MFT 缓存（内存或磁盘快照）；
+    // 若已有快照直接在内存中做子树匹配，避免跑耗时数十秒的目录递归。
+    // 若尚未生成快照且子目录文件较少（<= 10000），则走轻量遍历；超过阈值则建全卷快照。
     if (!isDriveRoot && trimmed.size() > 2 && trimmed[1] == ':' &&
         std::isalpha(static_cast<unsigned char>(trimmed[0])) != 0) {
-        bool overflow = false;
-        std::vector<FileEntry> walked = FallbackWalkFiles(
-            trimmed, minSize, skipTop, kSubtreeWalkLimit, &overflow);
-        if (std::getenv("CDC_TRACE") != nullptr) {
-            std::fprintf(stderr, "mft: 子目录 %s 走目录遍历 -> %zu 个文件\n",
-                         trimmed.c_str(), walked.size());
-        }
-        if (!overflow) {
-            std::vector<FileEntry> filtered;
-            filtered.reserve(walked.size());
-            for (FileEntry& entry : walked) {
-                if (keep(Basename(entry.path), entry.size)) {
-                    filtered.push_back(std::move(entry));
+        const std::string drive = DriveRootOf(trimmed);
+        const std::string volumePath = "\\\\.\\" + drive;
+        UniqueHandle volHandle = OpenVolumeHandle(volumePath);
+        if (volHandle) {
+            NTFS_VOLUME_DATA_BUFFER volData = {};
+            DWORD volRet = 0;
+            if (DeviceIoControl(volHandle.get(), FSCTL_GET_NTFS_VOLUME_DATA,
+                                nullptr, 0, &volData, sizeof(volData), &volRet,
+                                nullptr) != 0) {
+                const uint64_t serial =
+                    static_cast<uint64_t>(volData.VolumeSerialNumber.QuadPart);
+                std::shared_ptr<Snapshot> cached = MemSnapshotGet(serial);
+                if (!cached) {
+                    if (auto loaded = LoadSnapshot(SnapshotPath(serial))) {
+                        cached = std::make_shared<Snapshot>(std::move(*loaded));
+                    }
+                }
+                if (!cached) {
+                    bool overflow = false;
+                    std::vector<FileEntry> walked = FallbackWalkFiles(
+                        trimmed, minSize, skipTop, kSubtreeWalkLimit, &overflow);
+                    if (!overflow) {
+                        std::vector<FileEntry> filtered;
+                        filtered.reserve(walked.size());
+                        for (FileEntry& entry : walked) {
+                            if (keep(Basename(entry.path), entry.size)) {
+                                filtered.push_back(std::move(entry));
+                            }
+                        }
+                        return filtered;
+                    }
                 }
             }
-            return filtered;
         }
     }
     if (trimmed.size() >= 2 && trimmed[1] == ':' &&
@@ -1299,6 +1638,41 @@ std::vector<FileEntry> ScanFilesWhere(const std::string& root, uint64_t minSize,
                 const size_t rootLen = rootLower.size() + 1;
                 const uint64_t nowUnix = NowUnixSeconds();
 
+                std::optional<uint64_t> targetDirIndex;
+                if (!isDriveRoot) {
+                    targetDirIndex = FindSubdirectoryIndex(dirs, trimmed);
+                }
+
+                std::unordered_map<uint64_t, bool> inSubtreeMemo;
+                if (targetDirIndex.has_value()) {
+                    inSubtreeMemo[*targetDirIndex] = true;
+                    inSubtreeMemo[5] = false;
+                }
+                auto isInSubtree = [&](uint64_t parentFrn) -> bool {
+                    uint64_t curr = parentFrn & 0xFFFF'FFFF'FFFFULL;
+                    std::vector<uint64_t> chain;
+                    while (curr != 0) {
+                        auto it = inSubtreeMemo.find(curr);
+                        if (it != inSubtreeMemo.end()) {
+                            const bool ans = it->second;
+                            for (const uint64_t c : chain) {
+                                inSubtreeMemo[c] = ans;
+                            }
+                            return ans;
+                        }
+                        chain.push_back(curr);
+                        auto dit = dirs.find(curr);
+                        if (dit == dirs.end()) {
+                            break;
+                        }
+                        curr = dit->second.parentFrn & 0xFFFF'FFFF'FFFFULL;
+                    }
+                    for (const uint64_t c : chain) {
+                        inSubtreeMemo[c] = false;
+                    }
+                    return false;
+                };
+
                 std::unordered_map<uint64_t, std::optional<std::string>>
                     dirCache;
                 dirCache.reserve(std::min<size_t>(dirs.size(), 65536));
@@ -1309,6 +1683,11 @@ std::vector<FileEntry> ScanFilesWhere(const std::string& root, uint64_t minSize,
                     (void)index;
                     if (raw.size < minSize || !keep(raw.name, raw.size)) {
                         continue;
+                    }
+                    if (!isDriveRoot && targetDirIndex.has_value()) {
+                        if (!isInSubtree(raw.parentFrn)) {
+                            continue;
+                        }
                     }
                     std::string dirPath;
                     if ((raw.parentFrn & 0xFFFF'FFFF'FFFFULL) == 5) {
@@ -1324,13 +1703,14 @@ std::vector<FileEntry> ScanFilesWhere(const std::string& root, uint64_t minSize,
                     }
 
                     std::string fullPath;
+                    fullPath.reserve(dirPath.size() + 1 + raw.name.size());
                     if (!dirPath.empty() && dirPath.back() == '\\') {
                         fullPath = dirPath + raw.name;
                     } else {
                         fullPath = dirPath + "\\" + raw.name;
                     }
 
-                    if (!isDriveRoot) {
+                    if (!isDriveRoot && !targetDirIndex.has_value()) {
                         const std::string lower = ToLowerAscii(fullPath);
                         if (lower.compare(0, rootPrefix.size(), rootPrefix) !=
                             0) {
@@ -1360,7 +1740,14 @@ std::vector<FileEntry> ScanFilesWhere(const std::string& root, uint64_t minSize,
                     entry.frn = raw.frn;
                     entry.firstLcn = raw.firstLcn;
                     entry.bytesPerCluster = static_cast<uint32_t>(bytesPerCluster);
+                    entry.volumeSerial = serial;
                     entry.canRawRead = raw.canRawRead && !recent;
+                    entry.canRawFull = raw.canRawFull && !recent;
+                    entry.canRawStrong = raw.canRawStrong && !recent;
+                    entry.midRawOffset =
+                        entry.canRawStrong ? raw.midRawOffset : 0;
+                    entry.tailRawOffset =
+                        entry.canRawStrong ? raw.tailRawOffset : 0;
                     entries.push_back(std::move(entry));
                 }
                 return entries;
@@ -1396,47 +1783,61 @@ bool SaveSnapshot(const std::string& path, const Snapshot& snapshot) {
         file == nullptr) {
         return false;
     }
-    std::vector<char> ioBuffer(256 * 1024);
-    std::setvbuf(file, ioBuffer.data(), _IOFBF, ioBuffer.size());
-    auto writeRaw = [file](const void* data, size_t length) {
-        return fwrite(data, 1, length, file) == length;
+    const size_t estimated =
+        128 + snapshot.dirs.size() * 48 + snapshot.files.size() * 96;
+    std::vector<uint8_t> buffer;
+    buffer.reserve(std::min<size_t>(estimated, 64 * 1024 * 1024));
+
+    auto appendRaw = [&](const void* data, size_t len) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(data);
+        buffer.insert(buffer.end(), b, b + len);
     };
-    auto writeU8 = [&](uint8_t value) { return writeRaw(&value, 1); };
-    auto writeU16 = [&](uint16_t value) { return writeRaw(&value, 2); };
-    auto writeU32 = [&](uint32_t value) { return writeRaw(&value, 4); };
-    auto writeU64 = [&](uint64_t value) { return writeRaw(&value, 8); };
-    auto writeStr = [&](const std::string& text) {
-        return writeU32(static_cast<uint32_t>(text.size())) &&
-               writeRaw(text.data(), text.size());
+    auto appendU8 = [&](uint8_t v) { buffer.push_back(v); };
+    auto appendU16 = [&](uint16_t v) { appendRaw(&v, 2); };
+    auto appendU32 = [&](uint32_t v) { appendRaw(&v, 4); };
+    auto appendU64 = [&](uint64_t v) { appendRaw(&v, 8); };
+    auto appendStr = [&](const std::string& text) {
+        appendU32(static_cast<uint32_t>(text.size()));
+        appendRaw(text.data(), text.size());
     };
 
-    bool ok = writeRaw("MFT3", 4);
-    ok = ok && writeU64(snapshot.volumeSerial);
-    ok = ok && writeU64(snapshot.journalId);
-    ok = ok && writeU64(static_cast<uint64_t>(snapshot.nextUsn));
-    ok = ok && writeU64(snapshot.minSize);
-    ok = ok && writeU32(snapshot.bytesPerCluster);
-    ok = ok && writeU32(static_cast<uint32_t>(snapshot.dirs.size()));
+    appendRaw("MFT4", 4);
+    appendU64(snapshot.volumeSerial);
+    appendU64(snapshot.journalId);
+    appendU64(static_cast<uint64_t>(snapshot.nextUsn));
+    appendU64(snapshot.minSize);
+    appendU32(snapshot.bytesPerCluster);
+    appendU32(static_cast<uint32_t>(snapshot.dirs.size()));
     for (const auto& [index, node] : snapshot.dirs) {
-        if (!ok) {
-            break;
-        }
-        ok = writeU64(index) && writeU16(node.seq) &&
-             writeU8(node.reparse ? 1 : 0) && writeU64(node.parentFrn) &&
-             writeStr(node.name);
+        appendU64(index);
+        appendU16(node.seq);
+        appendU8(node.reparse ? 1 : 0);
+        appendU64(node.parentFrn);
+        appendStr(node.name);
     }
-    ok = ok && writeU32(static_cast<uint32_t>(snapshot.files.size()));
+    appendU32(static_cast<uint32_t>(snapshot.files.size()));
     for (const auto& [index, raw] : snapshot.files) {
-        if (!ok) {
-            break;
+        appendU64(index);
+        appendU64(raw.frn);
+        appendU64(raw.parentFrn);
+        appendU64(raw.size);
+        appendU64(raw.mtime);
+        appendU64(raw.firstLcn);
+        appendU64(raw.sortKey);
+        const uint8_t rawFlags = (raw.canRawRead ? 1 : 0) |
+                                 (raw.canRawFull ? 2 : 0) |
+                                 (raw.canRawStrong ? 4 : 0);
+        appendU8(rawFlags);
+        if (raw.canRawStrong) {
+            appendU64(raw.midRawOffset);
+            appendU64(raw.tailRawOffset);
         }
-        ok = writeU64(index) && writeU64(raw.frn) && writeU64(raw.parentFrn) &&
-             writeU64(raw.size) && writeU64(raw.mtime) &&
-             writeU64(raw.firstLcn) && writeU64(raw.sortKey) &&
-             writeU8(raw.canRawRead ? 1 : 0) && writeStr(raw.name);
+        appendStr(raw.name);
     }
+
+    const size_t written = fwrite(buffer.data(), 1, buffer.size(), file);
     fclose(file);
-    if (!ok) {
+    if (written != buffer.size()) {
         DeleteFileW(Utf8ToWide(temp).c_str());
         return false;
     }
@@ -1454,27 +1855,53 @@ std::optional<Snapshot> LoadSnapshot(const std::string& path) {
         file == nullptr) {
         return std::nullopt;
     }
-    std::vector<char> ioBuffer(256 * 1024);
-    std::setvbuf(file, ioBuffer.data(), _IOFBF, ioBuffer.size());
-    auto readRaw = [file](void* data, size_t length) {
-        return fread(data, 1, length, file) == length;
+    if (_fseeki64(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return std::nullopt;
+    }
+    const int64_t fileSize = _ftelli64(file);
+    if (fileSize < 40 || fileSize > 1024LL * 1024 * 1024) {
+        fclose(file);
+        return std::nullopt;
+    }
+    _fseeki64(file, 0, SEEK_SET);
+
+    std::vector<uint8_t> buffer(static_cast<size_t>(fileSize));
+    const size_t bytesRead = fread(buffer.data(), 1, buffer.size(), file);
+    fclose(file);
+    if (bytesRead != buffer.size()) {
+        return std::nullopt;
+    }
+
+    const uint8_t* ptr = buffer.data();
+    const uint8_t* end = buffer.data() + buffer.size();
+
+    auto readRaw = [&](void* dst, size_t n) -> bool {
+        if (ptr + n > end) return false;
+        std::memcpy(dst, ptr, n);
+        ptr += n;
+        return true;
     };
-    auto readU8 = [&](uint8_t& value) { return readRaw(&value, 1); };
-    auto readU16 = [&](uint16_t& value) { return readRaw(&value, 2); };
-    auto readU32 = [&](uint32_t& value) { return readRaw(&value, 4); };
-    auto readU64 = [&](uint64_t& value) { return readRaw(&value, 8); };
-    auto readStr = [&](std::string& text) {
+    auto readU8 = [&](uint8_t& val) -> bool { return readRaw(&val, 1); };
+    auto readU16 = [&](uint16_t& val) -> bool { return readRaw(&val, 2); };
+    auto readU32 = [&](uint32_t& val) -> bool { return readRaw(&val, 4); };
+    auto readU64 = [&](uint64_t& val) -> bool { return readRaw(&val, 8); };
+    auto readStr = [&](std::string& text) -> bool {
         uint32_t length = 0;
-        if (!readU32(length) || length > 32 * 1024) {
-            return false;
-        }
-        text.resize(length);
-        return length == 0 || readRaw(text.data(), length);
+        if (!readU32(length) || length > 32 * 1024) return false;
+        if (ptr + length > end) return false;
+        text.assign(reinterpret_cast<const char*>(ptr), length);
+        ptr += length;
+        return true;
     };
 
     char magic[4] = {};
-    if (!readRaw(magic, 4) || std::memcmp(magic, "MFT3", 4) != 0) {
-        fclose(file);
+    if (!readRaw(magic, 4)) {
+        return std::nullopt;
+    }
+    const bool isV3 = (std::memcmp(magic, "MFT3", 4) == 0);
+    const bool isV4 = (std::memcmp(magic, "MFT4", 4) == 0);
+    if (!isV3 && !isV4) {
         return std::nullopt;
     }
     Snapshot snapshot;
@@ -1482,42 +1909,49 @@ std::optional<Snapshot> LoadSnapshot(const std::string& path) {
     bool ok = readU64(snapshot.volumeSerial) && readU64(snapshot.journalId) &&
               readU64(nextUsn) && readU64(snapshot.minSize) &&
               readU32(snapshot.bytesPerCluster);
+    if (!ok) return std::nullopt;
     snapshot.nextUsn = static_cast<int64_t>(nextUsn);
 
     uint32_t dirCount = 0;
-    ok = ok && readU32(dirCount);
-    for (uint32_t index = 0; ok && index < dirCount; ++index) {
+    if (!readU32(dirCount)) return std::nullopt;
+    snapshot.dirs.reserve(dirCount);
+    for (uint32_t i = 0; i < dirCount; ++i) {
         uint64_t id = 0;
         DirNode node;
         uint8_t reparse = 0;
-        ok = readU64(id) && readU16(node.seq) && readU8(reparse) &&
-             readU64(node.parentFrn) && readStr(node.name);
-        if (!ok) {
-            break;
+        if (!readU64(id) || !readU16(node.seq) || !readU8(reparse) ||
+            !readU64(node.parentFrn) || !readStr(node.name)) {
+            return std::nullopt;
         }
-        node.reparse = reparse != 0;
+        node.reparse = (reparse != 0);
         snapshot.dirs[id] = std::move(node);
     }
 
     uint32_t fileCount = 0;
-    ok = ok && readU32(fileCount);
-    for (uint32_t index = 0; ok && index < fileCount; ++index) {
+    if (!readU32(fileCount)) return std::nullopt;
+    snapshot.files.reserve(fileCount);
+    for (uint32_t i = 0; i < fileCount; ++i) {
         uint64_t id = 0;
         RawFile raw;
-        uint8_t canRawRead = 0;
-        ok = readU64(id) && readU64(raw.frn) && readU64(raw.parentFrn) &&
-             readU64(raw.size) && readU64(raw.mtime) &&
-             readU64(raw.firstLcn) && readU64(raw.sortKey) &&
-             readU8(canRawRead) && readStr(raw.name);
-        if (!ok) {
-            break;
+        uint8_t rawFlags = 0;
+        if (!readU64(id) || !readU64(raw.frn) || !readU64(raw.parentFrn) ||
+            !readU64(raw.size) || !readU64(raw.mtime) ||
+            !readU64(raw.firstLcn) || !readU64(raw.sortKey) ||
+            !readU8(rawFlags)) {
+            return std::nullopt;
         }
-        raw.canRawRead = canRawRead != 0;
+        raw.canRawRead = (rawFlags & 1) != 0;
+        raw.canRawFull = (rawFlags & 2) != 0;
+        raw.canRawStrong = isV4 && ((rawFlags & 4) != 0);
+        if (raw.canRawStrong) {
+            if (!readU64(raw.midRawOffset) || !readU64(raw.tailRawOffset)) {
+                return std::nullopt;
+            }
+        }
+        if (!readStr(raw.name)) {
+            return std::nullopt;
+        }
         snapshot.files[id] = std::move(raw);
-    }
-    fclose(file);
-    if (!ok) {
-        return std::nullopt;
     }
     return snapshot;
 }

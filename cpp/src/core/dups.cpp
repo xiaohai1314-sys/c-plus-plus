@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "blake3.h"
 #include "core/bigfiles.h"
 #include "core/digest.h"
 #include "core/disk.h"
@@ -262,8 +263,11 @@ std::vector<std::vector<mft::FileEntry>> ScanDrivesPerPhysicalDisk(
         if (gDupCancel.load() || scanstate::WasCancelled("dup")) {
             return {};
         }
-        std::vector<mft::FileEntry> files =
-            mft::ScanFiles(root, minSize, SkipTop());
+        std::vector<mft::FileEntry> files = mft::ScanFilesWhere(
+            root, minSize, SkipTop(),
+            [](const std::string& name, uint64_t) {
+                return !IsSystemFileName(name);
+            });
         const uint64_t done = enumerated.fetch_add(1) + 1;
         std::string label = root;
         while (!label.empty() && label.back() == '\\') {
@@ -310,7 +314,13 @@ struct DupCandidate {
     uint64_t firstLcn = 0;
     uint32_t bytesPerCluster = 0;
     bool canRawRead = false;
+    bool canRawFull = false;
+    bool canRawStrong = false;
     bool isSsd = false;
+    uint64_t midRawOffset = 0;
+    uint64_t tailRawOffset = 0;
+    uint32_t bucketSize = 0;
+    std::unique_ptr<blake3_hasher> strongHeadState;
     std::optional<filehash::FileId> fileId;
     std::optional<Digest> head;
     std::optional<Digest> sample;
@@ -453,6 +463,287 @@ void FlushCandidateHashes(hashcache::HashCache& cache,
     }
 }
 
+void RunTripleStage(std::vector<DupCandidate>& items, uint64_t chunkLen,
+                    bool isStrong, size_t hddNcqWorkers, bool trace,
+                    const char* label) {
+    auto needsWork = [isStrong](const DupCandidate& item) -> bool {
+        return isStrong ? !item.strong.has_value()
+                        : (!item.sample.has_value() && !item.full.has_value());
+    };
+
+    // 第 1 层：原生卷异步重叠三段直读（覆盖单区段及主区段有序候选文件）。
+    struct RawTripleJob {
+        char letter = 'C';
+        std::string root;
+        bool isSsd = false;
+        std::vector<fastio::RawTripleTarget> targets;
+    };
+    std::unordered_map<char, RawTripleJob> rawByDrive;
+    size_t rawCount = 0;
+    for (size_t index = 0; index < items.size(); ++index) {
+        DupCandidate& item = items[index];
+        if (!needsWork(item)) {
+            continue;
+        }
+        if (item.canRawStrong && item.size > chunkLen * 3 &&
+            item.bytesPerCluster > 0 && item.firstLcn > 0) {
+            char letter = 'C';
+            for (const char ch : item.path) {
+                if (ch != '\\' && ch != '/') {
+                    letter = static_cast<char>(
+                        std::toupper(static_cast<unsigned char>(ch)));
+                    break;
+                }
+            }
+            fastio::RawTripleTarget target;
+            target.idx = index;
+            target.headOffset =
+                item.firstLcn * static_cast<uint64_t>(item.bytesPerCluster);
+            target.midOffset = item.midRawOffset;
+            target.tailOffset =
+                isStrong ? item.tailRawOffset
+                         : (item.tailRawOffset + (kStrongChunk - chunkLen));
+            target.chunkLen = static_cast<size_t>(chunkLen);
+            if (isStrong && item.strongHeadState != nullptr) {
+                target.preSeededHead = std::move(item.strongHeadState);
+            }
+            auto found = rawByDrive.find(letter);
+            if (found == rawByDrive.end()) {
+                RawTripleJob job;
+                job.letter = letter;
+                job.root = std::string(1, letter) + ":\\";
+                job.isSsd = item.isSsd;
+                found = rawByDrive.emplace(letter, std::move(job)).first;
+            }
+            found->second.targets.push_back(std::move(target));
+            ++rawCount;
+        }
+    }
+
+    if (!rawByDrive.empty() && !gDupCancel.load()) {
+        std::vector<RawTripleJob> jobs;
+        jobs.reserve(rawByDrive.size());
+        for (auto& entry : rawByDrive) {
+            jobs.push_back(std::move(entry.second));
+        }
+        const std::atomic<bool>& cancel = gDupCancel;
+        const std::vector<std::vector<std::pair<size_t, Digest>>> batches =
+            RunDiskAwareNcq(
+                std::move(jobs),
+                [](const RawTripleJob& job) -> const std::string& {
+                    return job.root;
+                },
+                [](const RawTripleJob&) -> uint64_t { return 0; }, 1,
+                [&cancel](RawTripleJob job) {
+                    return fastio::CoalescedRawVolumeTriples(
+                        job.letter, std::move(job.targets), job.isSsd, cancel,
+                        [] { Tick(); });
+                });
+        for (const auto& batch : batches) {
+            for (const auto& [index, digest] : batch) {
+                DupCandidate& item = items[index];
+                if (isStrong) {
+                    item.strong = digest;
+                    item.dirtyStrong = true;
+                } else {
+                    item.sample = digest;
+                    item.dirtySample = true;
+                }
+            }
+        }
+    }
+
+    if (DupCancelled()) {
+        for (DupCandidate& item : items) {
+            item.strongHeadState.reset();
+        }
+        return;
+    }
+
+    // 第 2 层：IOCP 文件句柄异步重叠三段读（多区段、近期修改或回退条目）。
+    std::unordered_map<char, disk::DiskKey> diskCache;
+    std::vector<fastio::IocpTripleRequest> ssdReqs;
+    std::unordered_map<
+        disk::DiskKey,
+        std::vector<std::pair<uint64_t, fastio::IocpTripleRequest>>,
+        disk::DiskKeyHash>
+        hddReqs;
+    size_t iocpCount = 0;
+
+    for (size_t index = 0; index < items.size(); ++index) {
+        DupCandidate& item = items[index];
+        if (!needsWork(item) || item.size <= chunkLen * 3) {
+            continue;
+        }
+        fastio::IocpTripleRequest req;
+        req.idx = index;
+        req.path = item.path;
+        req.frn = item.frn;
+        req.size = item.size;
+        req.chunkLen = static_cast<size_t>(chunkLen);
+        req.hasFileId = item.fileId.has_value();
+        if (isStrong && item.strongHeadState != nullptr) {
+            req.preSeededHead = std::move(item.strongHeadState);
+        }
+        ++iocpCount;
+        const disk::DiskKey key = disk::KeyForPath(item.path, diskCache);
+        if (key.kind == disk::DiskKeyKind::Ssd) {
+            ssdReqs.push_back(std::move(req));
+        } else {
+            hddReqs[key].emplace_back(item.sortKey, std::move(req));
+        }
+    }
+
+    if (!ssdReqs.empty() || !hddReqs.empty()) {
+        std::vector<std::vector<fastio::IocpTripleRequest>> hddLists;
+        hddLists.reserve(hddReqs.size());
+        for (auto& entry : hddReqs) {
+            auto& list = entry.second;
+            std::stable_sort(
+                list.begin(), list.end(),
+                [](const std::pair<uint64_t, fastio::IocpTripleRequest>& left,
+                   const std::pair<uint64_t, fastio::IocpTripleRequest>& right) {
+                    return left.first < right.first;
+                });
+            std::vector<fastio::IocpTripleRequest> queue;
+            queue.reserve(list.size());
+            for (auto& pairItem : list) {
+                queue.push_back(std::move(pairItem.second));
+            }
+            hddLists.push_back(std::move(queue));
+        }
+
+        std::vector<fastio::IocpTripleResult> all;
+        std::vector<std::vector<fastio::IocpTripleResult>> hddResults(
+            hddLists.size());
+        std::vector<std::thread> threads;
+        threads.reserve(hddLists.size());
+        for (size_t slot = 0; slot < hddLists.size(); ++slot) {
+            threads.emplace_back([&hddLists, &hddResults, slot] {
+                hddResults[slot] = fastio::IocpReadTriples(
+                    std::move(hddLists[slot]), 16, false, gDupCancel,
+                    [] { Tick(); });
+            });
+        }
+        if (!ssdReqs.empty()) {
+            all = fastio::IocpReadTriples(std::move(ssdReqs), 32, true,
+                                          gDupCancel, [] { Tick(); });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        for (auto& part : hddResults) {
+            for (auto& res : part) {
+                all.push_back(std::move(res));
+            }
+        }
+        for (const fastio::IocpTripleResult& res : all) {
+            DupCandidate& item = items[res.idx];
+            if (!item.fileId.has_value() && res.fileId.has_value()) {
+                item.fileId = res.fileId;
+            }
+            if (isStrong) {
+                item.strong = res.digest;
+                item.dirtyStrong = true;
+            } else {
+                item.sample = res.digest;
+                item.dirtySample = true;
+            }
+        }
+    }
+
+    if (DupCancelled()) {
+        for (DupCandidate& item : items) {
+            item.strongHeadState.reset();
+        }
+        return;
+    }
+
+    // 第 3 层：极小文件（≤ 3 * chunkLen）走原有顺序全文/采样路径。
+    std::vector<size_t> smallIndices;
+    for (size_t index = 0; index < items.size(); ++index) {
+        if (needsWork(items[index]) && items[index].size <= chunkLen * 3) {
+            smallIndices.push_back(index);
+        }
+    }
+    if (!smallIndices.empty()) {
+        struct SmallTask {
+            size_t idx = 0;
+            DupCandidate item;
+        };
+        std::vector<SmallTask> smallTasks;
+        smallTasks.reserve(smallIndices.size());
+        for (const size_t idx : smallIndices) {
+            smallTasks.push_back(SmallTask{idx, std::move(items[idx])});
+        }
+        std::vector<SmallTask> smallDone = RunDiskAwareNcq(
+            std::move(smallTasks),
+            [](const SmallTask& t) -> const std::string& {
+                return t.item.path;
+            },
+            [](const SmallTask& t) { return t.item.sortKey; }, hddNcqWorkers,
+            [chunkLen, isStrong](SmallTask task) {
+                DupCandidate& item = task.item;
+                if (gDupCancel.load()) {
+                    return task;
+                }
+                if (!item.isSsd && item.size <= kHddSeqThreshold) {
+                    const std::optional<filehash::SeqSampleFull> hashed =
+                        filehash::ReadHddSeqSampleAndFull(
+                            item.path, item.frn, item.size, chunkLen);
+                    if (hashed.has_value()) {
+                        if (!item.fileId.has_value()) {
+                            item.fileId = hashed->fileId;
+                        }
+                        if (isStrong) {
+                            item.strong = hashed->sample;
+                            item.dirtyStrong = true;
+                        } else {
+                            item.sample = hashed->sample;
+                            item.dirtySample = true;
+                        }
+                        item.full = hashed->full;
+                        item.dirtyFull = true;
+                    }
+                } else {
+                    const std::optional<filehash::Hashed> hashed =
+                        isStrong ? filehash::StrongHash(item.path, item.frn,
+                                                        item.size)
+                                 : filehash::SampleHash(item.path, item.frn,
+                                                        item.size);
+                    if (hashed.has_value()) {
+                        if (!item.fileId.has_value()) {
+                            item.fileId = hashed->fileId;
+                        }
+                        if (isStrong) {
+                            item.strong = hashed->digest;
+                            item.dirtyStrong = true;
+                        } else {
+                            item.sample = hashed->digest;
+                            item.dirtySample = true;
+                        }
+                        item.full = hashed->digest;
+                        item.dirtyFull = true;
+                    }
+                }
+                Tick();
+                return task;
+            });
+        for (SmallTask& done : smallDone) {
+            items[done.idx] = std::move(done.item);
+        }
+    }
+
+    for (DupCandidate& item : items) {
+        item.strongHeadState.reset();
+    }
+
+    if (trace) {
+        std::fprintf(stderr, "dup[%s]: 阶段2 raw=%zu, iocp=%zu, small=%zu\n",
+                     label, rawCount, iocpCount, smallIndices.size());
+    }
+}
+
 PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
                               bool turbo, size_t hddNcqWorkers,
                               bool updateStage, bool trace,
@@ -474,6 +765,8 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
         bool isSsd = false;
         std::vector<fastio::RawHeadTarget> targets;
     };
+    constexpr size_t kMaxFusedHeads = 40'000;
+    size_t fusedCount = 0;
     std::unordered_map<char, RawJob> rawByDrive;
     for (size_t index = 0; index < stage1Done.size(); ++index) {
         DupCandidate& item = stage1Done[index];
@@ -490,12 +783,26 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
                     break;
                 }
             }
+            const bool canFuse = fast && !turbo && !item.strong.has_value() &&
+                                 item.canRawStrong &&
+                                 item.size >= kStrongChunk * 3 &&
+                                 (item.size % 512 != 0) &&
+                                 item.bucketSize <= 8 &&
+                                 fusedCount < kMaxFusedHeads;
             const uint64_t offset =
                 item.firstLcn * static_cast<uint64_t>(item.bytesPerCluster);
             fastio::RawHeadTarget target;
             target.idx = index;
             target.offset = offset;
-            target.want = static_cast<size_t>(std::min(kHeadChunk, item.size));
+            if (canFuse) {
+                target.want = static_cast<size_t>(kStrongChunk);
+                target.captureStrongHead = true;
+                ++fusedCount;
+            } else {
+                target.want =
+                    static_cast<size_t>(std::min(kHeadChunk, item.size));
+                target.captureStrongHead = false;
+            }
             auto found = rawByDrive.find(letter);
             if (found == rawByDrive.end()) {
                 RawJob job;
@@ -515,7 +822,7 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
             jobs.push_back(std::move(entry.second));
         }
         const std::atomic<bool>& cancel = gDupCancel;
-        const std::vector<std::vector<std::pair<size_t, Digest>>> batches =
+        std::vector<std::vector<fastio::RawHeadResult>> batches =
             RunDiskAwareNcq(
                 std::move(jobs),
                 [](const RawJob& job) -> const std::string& { return job.root; },
@@ -526,15 +833,18 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
                         job.letter, std::move(job.targets), job.isSsd, cancel,
                         [] { Tick(); });
                 });
-        for (const std::vector<std::pair<size_t, Digest>>& batch : batches) {
-            for (const auto& [index, digest] : batch) {
-                DupCandidate& item = stage1Done[index];
-                item.head = digest;
+        for (std::vector<fastio::RawHeadResult>& batch : batches) {
+            for (fastio::RawHeadResult& res : batch) {
+                DupCandidate& item = stage1Done[res.idx];
+                item.head = res.headDigest;
                 item.dirtyHead = true;
+                if (res.strongHeadState != nullptr) {
+                    item.strongHeadState = std::move(res.strongHeadState);
+                }
                 if (item.size <= kHeadChunk) {
-                    item.sample = digest;
-                    item.strong = digest;
-                    item.full = digest;
+                    item.sample = res.headDigest;
+                    item.strong = res.headDigest;
+                    item.full = res.headDigest;
                     item.dirtySample = true;
                     item.dirtyStrong = true;
                     item.dirtyFull = true;
@@ -596,7 +906,7 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
             for (size_t slot = 0; slot < hddLists.size(); ++slot) {
                 threads.emplace_back([&hddLists, &hddResults, slot] {
                     hddResults[slot] = fastio::IocpReadHeads(
-                        std::move(hddLists[slot]), 8, gDupCancel,
+                        std::move(hddLists[slot]), 16, gDupCancel,
                         [] { Tick(); });
                 });
             }
@@ -666,6 +976,7 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
             }
         } else {
             for (DupCandidate& item : kept) {
+                item.strongHeadState.reset();
                 output.eliminated.push_back(std::move(item));
             }
         }
@@ -699,61 +1010,20 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
         if (updateStage) {
             scanstate::Stage("dup", "快速比对");
         }
-        std::vector<DupCandidate> stage2Done = RunDiskAwareNcq(
-            std::move(stage2Items),
-            [](const DupCandidate& item) -> const std::string& {
-                return item.path;
-            },
-            [](const DupCandidate& item) { return item.sortKey; },
-            hddNcqWorkers, [](DupCandidate item) {
-                if (gDupCancel.load()) {
-                    return item;
-                }
-                if (!item.strong.has_value()) {
-                    if (!item.isSsd && item.size <= kHddSeqThreshold) {
-                        const std::optional<filehash::SeqSampleFull> hashed =
-                            filehash::ReadHddSeqSampleAndFull(
-                                item.path, item.frn, item.size, kStrongChunk);
-                        if (hashed.has_value()) {
-                            if (!item.fileId.has_value()) {
-                                item.fileId = hashed->fileId;
-                            }
-                            item.strong = hashed->sample;
-                            item.full = hashed->full;
-                            item.dirtyStrong = true;
-                            item.dirtyFull = true;
-                        }
-                    } else {
-                        const std::optional<filehash::Hashed> hashed =
-                            filehash::StrongHash(item.path, item.frn, item.size);
-                        if (hashed.has_value()) {
-                            if (!item.fileId.has_value()) {
-                                item.fileId = hashed->fileId;
-                            }
-                            item.strong = hashed->digest;
-                            item.dirtyStrong = true;
-                            if (item.size <= kStrongChunk * 3) {
-                                item.full = hashed->digest;
-                                item.dirtyFull = true;
-                            }
-                        }
-                    }
-                    Tick();
-                }
-                return item;
-            });
+        RunTripleStage(stage2Items, kStrongChunk, true, hddNcqWorkers, trace,
+                       label);
 
         if (DupCancelled()) {
-            for (DupCandidate& item : stage2Done) {
+            for (DupCandidate& item : stage2Items) {
                 output.eliminated.push_back(std::move(item));
             }
             return output;
         }
-        output.finalItems = std::move(stage2Done);
+        output.finalItems = std::move(stage2Items);
         return output;
     }
 
-    // 阶段 2：4KB 碰撞候选做采样比对（机械盘 ≤2MB 一次顺序读同时算出 sample 与 full）。
+    // 阶段 2：4KB 碰撞候选做采样比对（原生卷三段异步直读 + IOCP 句柄兜底）。
     size_t needSample = 0;
     for (const DupCandidate& item : stage2Items) {
         if (!item.sample.has_value() && !item.full.has_value()) {
@@ -764,47 +1034,9 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
     if (updateStage) {
         scanstate::Stage("dup", "采样比对");
     }
-    std::vector<DupCandidate> stage2Done = RunDiskAwareNcq(
-        std::move(stage2Items),
-        [](const DupCandidate& item) -> const std::string& { return item.path; },
-        [](const DupCandidate& item) { return item.sortKey; }, hddNcqWorkers,
-        [](DupCandidate item) {
-            if (gDupCancel.load()) {
-                return item;
-            }
-            if (!item.sample.has_value() && !item.full.has_value()) {
-                if (!item.isSsd && item.size <= kHddSeqThreshold) {
-                    const std::optional<filehash::SeqSampleFull> hashed =
-                        filehash::ReadHddSeqSampleAndFull(
-                            item.path, item.frn, item.size, kSampleChunk);
-                    if (hashed.has_value()) {
-                        if (!item.fileId.has_value()) {
-                            item.fileId = hashed->fileId;
-                        }
-                        item.sample = hashed->sample;
-                        item.full = hashed->full;
-                        item.dirtySample = true;
-                        item.dirtyFull = true;
-                    }
-                } else {
-                    const std::optional<filehash::Hashed> hashed =
-                        filehash::SampleHash(item.path, item.frn, item.size);
-                    if (hashed.has_value()) {
-                        if (!item.fileId.has_value()) {
-                            item.fileId = hashed->fileId;
-                        }
-                        item.sample = hashed->digest;
-                        item.dirtySample = true;
-                        if (item.size <= kSampleChunk * 3) {
-                            item.full = hashed->digest;
-                            item.dirtyFull = true;
-                        }
-                    }
-                }
-                Tick();
-            }
-            return item;
-        });
+    RunTripleStage(stage2Items, kSampleChunk, false, hddNcqWorkers, trace,
+                   label);
+    std::vector<DupCandidate> stage2Done = std::move(stage2Items);
 
     if (DupCancelled()) {
         for (DupCandidate& item : stage2Done) {
@@ -1194,27 +1426,47 @@ Json ScanDups(const std::optional<std::string>& root,
     }
 
     // 第一层快速过滤：大小唯一的文件直接剔除。
-    std::unordered_map<uint64_t, std::vector<mft::FileEntry>> bySize;
+    std::vector<mft::FileEntry> allFiles;
+    size_t totalEnumerate = 0;
+    for (const auto& files : perDrive) {
+        totalEnumerate += files.size();
+    }
+    allFiles.reserve(totalEnumerate);
     for (std::vector<mft::FileEntry>& files : perDrive) {
         for (mft::FileEntry& entry : files) {
             if (IsSystemFileName(entry.path)) {
                 continue;
             }
-            bySize[entry.size].push_back(std::move(entry));
+            allFiles.push_back(std::move(entry));
         }
     }
     perDrive.clear();
 
+    std::sort(allFiles.begin(), allFiles.end(),
+              [](const mft::FileEntry& a, const mft::FileEntry& b) {
+                  return a.size < b.size;
+              });
+
     std::vector<std::vector<mft::FileEntry>> sizeBuckets;
-    sizeBuckets.reserve(bySize.size());
     size_t candidatesCount = 0;
-    for (auto& entry : bySize) {
-        if (entry.second.size() >= 2) {
-            candidatesCount += entry.second.size();
-            sizeBuckets.push_back(std::move(entry.second));
+    size_t i = 0;
+    while (i < allFiles.size()) {
+        size_t j = i + 1;
+        while (j < allFiles.size() && allFiles[j].size == allFiles[i].size) {
+            ++j;
         }
+        if (j - i >= 2) {
+            std::vector<mft::FileEntry> bucket;
+            bucket.reserve(j - i);
+            for (size_t k = i; k < j; ++k) {
+                bucket.push_back(std::move(allFiles[k]));
+            }
+            candidatesCount += bucket.size();
+            sizeBuckets.push_back(std::move(bucket));
+        }
+        i = j;
     }
-    bySize.clear();
+    allFiles.clear();
 
     if (trace) {
         const double seconds =
@@ -1274,7 +1526,16 @@ Json ScanDups(const std::optional<std::string>& root,
             candidate.firstLcn = entry.firstLcn;
             candidate.bytesPerCluster = entry.bytesPerCluster;
             candidate.canRawRead = entry.canRawRead;
+            candidate.canRawFull = entry.canRawFull;
+            candidate.canRawStrong = entry.canRawStrong;
             candidate.isSsd = isSsd;
+            candidate.midRawOffset = entry.midRawOffset;
+            candidate.tailRawOffset = entry.tailRawOffset;
+            candidate.bucketSize = static_cast<uint32_t>(bucket.size());
+            if (entry.volumeSerial != 0 && entry.frn != 0) {
+                candidate.fileId = filehash::FileId{
+                    static_cast<uint32_t>(entry.volumeSerial), entry.frn};
+            }
             if (cached != nullptr) {
                 candidate.head = cached->head;
                 candidate.sample = cached->sample;
@@ -1320,9 +1581,10 @@ Json ScanDups(const std::optional<std::string>& root,
         std::vector<DupGroup> groups;
         BuildDupGroups(std::move(readyFinal), groups);
         SortDupGroups(groups);
-        WriteTextFile(cachePath, GroupsToJson(groups).dump());
+        Json out = GroupsToJson(groups);
+        WriteTextFile(cachePath, out.dump());
         scanstate::End("dup");
-        return GroupsToJson(groups);
+        return out;
     }
 
     scanstate::Reset("dup", pendingTotal);
@@ -1389,11 +1651,12 @@ Json ScanDups(const std::optional<std::string>& root,
         std::fprintf(stderr, "dup: 找到 %zu 组, 总用时 %.1fs\n", groups.size(),
                      seconds);
     }
+    Json out = GroupsToJson(groups);
     if (!scanstate::WasCancelled("dup")) {
-        WriteTextFile(cachePath, GroupsToJson(groups).dump());
+        WriteTextFile(cachePath, out.dump());
     }
     scanstate::End("dup");
-    return GroupsToJson(groups);
+    return out;
 }
 
 Json CachedResult(const std::optional<std::string>& root,
@@ -1522,7 +1785,8 @@ Json DeleteDups(const Json& items) {
     std::vector<std::string> eligible;
     std::unordered_map<std::string, uint64_t> sizes;
     std::vector<VerifyItem> pendingVerify;
-    std::vector<std::string> keeperSet;
+    std::unordered_set<std::string> keeperSet;
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> attrMap;
 
     for (const VerifyItem& item : parsed) {
         if (task::IsCancelled("dup_delete")) {
@@ -1531,21 +1795,16 @@ Json DeleteDups(const Json& items) {
         }
         task::AddDone("dup_delete", 1);
         const std::string& path = item.path;
-        if (!PathExists(path)) {
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        if (GetFileAttributesExW(Utf8ToWide(path).c_str(),
+                                 GetFileExInfoStandard, &data) == 0) {
             failed.push_back(path);
-            reasons.push_back(path + "：文件已不存在");
+            reasons.push_back(path + "：读不到文件属性或文件已不存在");
             continue;
         }
         if (safety::ExplicitDeleteForbidden(path)) {
             failed.push_back(path);
             reasons.push_back(path + "：受保护路径或密码库，已跳过");
-            continue;
-        }
-        WIN32_FILE_ATTRIBUTE_DATA data = {};
-        if (GetFileAttributesExW(Utf8ToWide(path).c_str(), GetFileExInfoStandard,
-                                 &data) == 0) {
-            failed.push_back(path);
-            reasons.push_back(path + "：读不到文件属性");
             continue;
         }
         const uint64_t size =
@@ -1556,23 +1815,29 @@ Json DeleteDups(const Json& items) {
             reasons.push_back(path + "：扫描后大小变了，已跳过");
             continue;
         }
-        if (FileMtimeSeconds(path) != item.mtime) {
+        const uint64_t fileMtime = mft::FileTimeToUnix(
+            (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+            static_cast<uint64_t>(data.ftLastWriteTime.dwLowDateTime));
+        if (fileMtime != item.mtime) {
             failed.push_back(path);
             reasons.push_back(path + "：扫描后修改时间变了，已跳过");
             continue;
         }
         if (!item.keeper.empty()) {
-            bool known = false;
-            for (const std::string& keeper : keeperSet) {
-                if (keeper == item.keeper) {
-                    known = true;
-                    break;
+            if (keeperSet.insert(item.keeper).second) {
+                // keeper 不在待删列表里，也要记属性供缓存键使用。
+                WIN32_FILE_ATTRIBUTE_DATA keeperData = {};
+                if (GetFileAttributesExW(Utf8ToWide(item.keeper).c_str(),
+                                         GetFileExInfoStandard,
+                                         &keeperData) != 0) {
+                    attrMap[item.keeper] = {
+                        (static_cast<uint64_t>(keeperData.nFileSizeHigh) << 32) |
+                            static_cast<uint64_t>(keeperData.nFileSizeLow),
+                        FileMtimeSeconds(item.keeper)};
                 }
             }
-            if (!known) {
-                keeperSet.push_back(item.keeper);
-            }
         }
+        attrMap[path] = {size, fileMtime};
         pendingVerify.push_back(item);
     }
 
@@ -1585,13 +1850,19 @@ Json DeleteDups(const Json& items) {
     }
 
     // 并行按盘计算保留项与待删副本的完整哈希（宁可跳过，不误删）。
-    std::vector<std::string> pathsToHash = keeperSet;
+    // 注意：复核必须重读磁盘，不能信任持久化缓存的 full 哈希——
+    // mtime 可以被 SetFileTime 伪装回去，缓存键 (size,mtime) 无法察觉内容被换。
+    // 但核对算出的全量哈希会写回缓存，供后续扫描与核对复用。
+    std::vector<std::string> pathsToHash(keeperSet.begin(), keeperSet.end());
     for (const VerifyItem& item : pendingVerify) {
         pathsToHash.push_back(item.path);
     }
     task::SetStage("dup_delete", "核对内容");
     task::SetProgress("dup_delete", 0, pathsToHash.size());
     const std::atomic<bool>& cancel = gDupCancel;
+    const uint64_t stampNow = NowUnixSeconds();
+    hashcache::HashCache verifyCache = hashcache::HashCache::LoadForPaths({});
+
     const std::vector<std::pair<std::string, std::optional<Digest>>> hashedList =
         RunDiskAwareNcq(
             std::move(pathsToHash),
@@ -1611,7 +1882,16 @@ Json DeleteDups(const Json& items) {
     hashedMap.reserve(hashedList.size());
     for (const auto& entry : hashedList) {
         hashedMap[entry.first] = entry.second;
+        const auto attr = attrMap.find(entry.first);
+        if (entry.second.has_value() && attr != attrMap.end()) {
+            // 全量结果写回缓存（绑定真实 size+mtime），扫描阶段复用。
+            verifyCache.RememberDigests(entry.first, attr->second.first,
+                                        attr->second.second, std::nullopt,
+                                        std::nullopt, std::nullopt,
+                                        entry.second, stampNow);
+        }
     }
+    verifyCache.SaveDirty();
 
     task::SetStage("dup_delete", "复核内容");
     task::SetProgress("dup_delete", 0, pendingVerify.size());

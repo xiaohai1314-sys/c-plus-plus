@@ -24,6 +24,7 @@ public:
     void Close();
     void DrainReplies();
     void PostJson(const std::string& json);
+    void PostJsonWide(const std::wstring& wide);
 
     bool ready() const { return webview_ != nullptr; }
 

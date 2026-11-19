@@ -199,10 +199,25 @@ async function removeSelected() {
   try {
     const report = await invoke<DeleteReport>("delete_dups", { items });
     toast(`移到回收站 ${report.deleted} 个，释放 ${fmtSize(report.freed)}。`);
+    const failedSet = new Set(report.failed || []);
+    const deletedSet = new Set(items.map((i) => i.path).filter((p) => !failedSet.has(p)));
+    for (const p of deletedSet) dupChecked.delete(p);
+    dupGroups.value = dupGroups.value
+      .map((group) => {
+        const remainingFiles: string[] = [];
+        const remainingMtimes: number[] = [];
+        group.files.forEach((f, idx) => {
+          if (!deletedSet.has(f)) {
+            remainingFiles.push(f);
+            remainingMtimes.push(group.mtimes[idx] || 0);
+          }
+        });
+        return { ...group, files: remainingFiles, mtimes: remainingMtimes };
+      })
+      .filter((group) => group.files.length >= 2);
   } catch (error) {
     toast("清理失败：" + error);
   }
-  await scan();
 }
 
 onMounted(async () => {

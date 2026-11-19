@@ -107,15 +107,18 @@ void Ipc::HandleSpecial(const Json& request) {
 }
 
 void Ipc::PostReply(Json reply) {
+    std::string text =
+        reply.dump(-1, ' ', false, Json::error_handler_t::replace);
+    std::wstring wide = Utf8ToWide(text);
     {
         std::lock_guard<std::mutex> lock(replyMutex_);
-        replies_.push_back(std::move(reply));
+        replies_.push_back(std::move(wide));
     }
     PostMessageW(hwnd_, WM_APP_REPLY, 0, 0);
 }
 
 void Ipc::DrainReplies() {
-    std::vector<Json> pending;
+    std::vector<std::wstring> pending;
     {
         std::lock_guard<std::mutex> lock(replyMutex_);
         pending.swap(replies_);
@@ -123,7 +126,7 @@ void Ipc::DrainReplies() {
     if (host_ == nullptr) {
         return;
     }
-    for (const Json& reply : pending) {
-        host_->PostJson(reply.dump(-1, ' ', false, Json::error_handler_t::replace));
+    for (const std::wstring& reply : pending) {
+        host_->PostJsonWide(reply);
     }
 }

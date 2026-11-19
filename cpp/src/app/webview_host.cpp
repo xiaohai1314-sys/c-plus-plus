@@ -334,6 +334,13 @@ void WebViewHost::PostJson(const std::string& json) {
     webview_->PostWebMessageAsJson(wide.c_str());
 }
 
+void WebViewHost::PostJsonWide(const std::wstring& wide) {
+    if (!webview_) {
+        return;
+    }
+    webview_->PostWebMessageAsJson(wide.c_str());
+}
+
 void WebViewHost::Close() {
     if (webview_ && handlersRegistered_) {
         webview_->remove_WebMessageReceived(messageToken_);

@@ -28,7 +28,12 @@ struct FileEntry {
     uint64_t frn = 0;
     uint64_t firstLcn = 0;
     uint32_t bytesPerCluster = 0;
+    uint64_t volumeSerial = 0;
     bool canRawRead = false;
+    bool canRawFull = false;
+    bool canRawStrong = false;
+    uint64_t midRawOffset = 0;
+    uint64_t tailRawOffset = 0;
 };
 
 using KeepFn = std::function<bool(const std::string& name, uint64_t size)>;
@@ -47,7 +52,7 @@ std::vector<FileEntry> FallbackWalkFiles(
     const std::vector<std::string>& skipTop, size_t limit = 0,
     bool* overflow = nullptr);
 
-// ---------- 快照（MFT3 二进制，与 Rust 版逐字节兼容） ----------
+// ---------- 快照（MFT4 二进制，兼容读取旧版 MFT3） ----------
 
 struct DirNode {
     uint16_t seq = 0;
@@ -65,6 +70,10 @@ struct RawFile {
     uint64_t firstLcn = 0;
     uint64_t sortKey = 0;
     bool canRawRead = false;
+    bool canRawFull = false;
+    bool canRawStrong = false;
+    uint64_t midRawOffset = 0;
+    uint64_t tailRawOffset = 0;
 };
 
 struct Snapshot {

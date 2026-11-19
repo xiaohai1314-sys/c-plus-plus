@@ -1,6 +1,8 @@
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -144,6 +146,10 @@ TEST(mft_snapshot_binary_roundtrip) {
     raw.firstLcn = 999;
     raw.sortKey = 999;
     raw.canRawRead = true;
+    raw.canRawFull = true;
+    raw.canRawStrong = true;
+    raw.midRawOffset = 999 * 4096ULL + 2'097'152ULL;
+    raw.tailRawOffset = 999 * 4096ULL + 4'194'304ULL - 262'144ULL;
     snapshot.files[20] = raw;
 
     CHECK(mft::SaveSnapshot(snapshotFile, snapshot));
@@ -156,6 +162,71 @@ TEST(mft_snapshot_binary_roundtrip) {
     CHECK_EQ(loaded->dirs.at(10).name, std::string("Users"));
     CHECK_EQ(loaded->files.at(20).firstLcn, static_cast<uint64_t>(999));
     CHECK(loaded->files.at(20).canRawRead);
+    CHECK(loaded->files.at(20).canRawFull);
+    CHECK(loaded->files.at(20).canRawStrong);
+    CHECK_EQ(loaded->files.at(20).midRawOffset, raw.midRawOffset);
+    CHECK_EQ(loaded->files.at(20).tailRawOffset, raw.tailRawOffset);
+
+    RemoveTree(dir);
+}
+
+TEST(mft_snapshot_loads_legacy_mft3) {
+    const std::string dir = TempDir("cdc-mft-mft3-test");
+    const std::string snapshotFile = JoinPath(dir, "legacy_mft3.bin");
+
+    std::vector<uint8_t> buf;
+    auto pushRaw = [&](const void* p, size_t n) {
+        const auto* bytes = static_cast<const uint8_t*>(p);
+        buf.insert(buf.end(), bytes, bytes + n);
+    };
+    auto pushU8 = [&](uint8_t v) { buf.push_back(v); };
+    auto pushU16 = [&](uint16_t v) { pushRaw(&v, 2); };
+    auto pushU32 = [&](uint32_t v) { pushRaw(&v, 4); };
+    auto pushU64 = [&](uint64_t v) { pushRaw(&v, 8); };
+    auto pushStr = [&](const std::string& s) {
+        pushU32(static_cast<uint32_t>(s.size()));
+        pushRaw(s.data(), s.size());
+    };
+
+    pushRaw("MFT3", 4);
+    pushU64(0x1122'3344ULL);
+    pushU64(0x5566'7788ULL);
+    pushU64(12345ULL);
+    pushU64(1ULL << 20);
+    pushU32(4096U);
+    pushU32(1U);  // dirCount
+    pushU64(10ULL);
+    pushU16(2U);
+    pushU8(0U);
+    pushU64(5ULL);
+    pushStr("Data");
+    pushU32(1U);  // fileCount
+    pushU64(20ULL);
+    pushU64((1ULL << 48) | 20ULL);
+    pushU64((2ULL << 48) | 10ULL);
+    pushU64(2'097'152ULL);
+    pushU64(1'700'000'001ULL);
+    pushU64(777ULL);
+    pushU64(777ULL);
+    pushU8(3U);  // canRawRead | canRawFull
+    pushStr("archive.zip");
+
+    FILE* file = nullptr;
+    CHECK_EQ(_wfopen_s(&file, Utf8ToWide(snapshotFile).c_str(), L"wb"), 0);
+    CHECK(file != nullptr);
+    CHECK_EQ(fwrite(buf.data(), 1, buf.size(), file), buf.size());
+    fclose(file);
+
+    const std::optional<mft::Snapshot> loaded = mft::LoadSnapshot(snapshotFile);
+    CHECK(loaded.has_value());
+    CHECK_EQ(loaded->volumeSerial, static_cast<uint64_t>(0x1122'3344ULL));
+    CHECK_EQ(loaded->dirs.at(10).name, std::string("Data"));
+    CHECK_EQ(loaded->files.at(20).name, std::string("archive.zip"));
+    CHECK(loaded->files.at(20).canRawRead);
+    CHECK(loaded->files.at(20).canRawFull);
+    CHECK(!loaded->files.at(20).canRawStrong);
+    CHECK_EQ(loaded->files.at(20).midRawOffset, static_cast<uint64_t>(0));
+    CHECK_EQ(loaded->files.at(20).tailRawOffset, static_cast<uint64_t>(0));
 
     RemoveTree(dir);
 }

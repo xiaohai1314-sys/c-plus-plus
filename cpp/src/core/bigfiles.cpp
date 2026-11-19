@@ -77,9 +77,17 @@ std::vector<mft::FileEntry> ScanDrivesPerPhysicalDisk(
         if (scanstate::WasCancelled("big")) {
             return {};
         }
+        // 谓词内一次完成系统文件过滤与分档阈值判断，避免主循环对每个结果
+        // 再重复一次 Basename/ExtensionOf/LowerAscii。
         return mft::ScanFilesWhere(
             drive, 2 * kMb, SkipTop(),
             [](const std::string& name, uint64_t size) {
+                if (size >= 100 * kMb) {
+                    return !IsSystemFileName(name);
+                }
+                if (IsSystemFileName(name)) {
+                    return false;
+                }
                 return size >= BigFileThresholdBytes(name);
             });
     };
@@ -126,15 +134,48 @@ struct BigFile {
 }  // namespace
 
 bool IsSystemFileName(const std::string& path) {
-    const std::string name = LowerAscii(Basename(path));
-    return name == "pagefile.sys" || name == "hiberfil.sys" ||
-           name == "swapfile.sys" || name == "dumpstack.log.tmp" ||
-           name == "memory.dmp";
+    const size_t slash = path.find_last_of("\\/");
+    const std::string_view name =
+        slash == std::string::npos
+            ? std::string_view(path)
+            : std::string_view(path).substr(slash + 1);
+    auto ieq = [](std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                std::tolower(static_cast<unsigned char>(b[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    return ieq(name, "pagefile.sys") || ieq(name, "hiberfil.sys") ||
+           ieq(name, "swapfile.sys") || ieq(name, "dumpstack.log.tmp") ||
+           ieq(name, "memory.dmp");
 }
 
 uint64_t BigFileThresholdBytes(const std::string& path) {
-    const std::string ext = ExtensionOf(path);
-    auto isOneOf = [&ext](std::initializer_list<const char*> values) {
+    const size_t slash = path.find_last_of("\\/");
+    const size_t start = slash == std::string::npos ? 0 : slash + 1;
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || dot <= start) {
+        return 50 * kMb;
+    }
+    char extBuf[16];
+    const size_t extLen = path.size() - (dot + 1);
+    if (extLen >= sizeof(extBuf) || extLen == 0) {
+        return 50 * kMb;
+    }
+    for (size_t i = 0; i < extLen; ++i) {
+        extBuf[i] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(path[dot + 1 + i])));
+    }
+    extBuf[extLen] = '\0';
+    const std::string_view ext(extBuf, extLen);
+
+    auto isOneOf = [&](std::initializer_list<const char*> values) {
         for (const char* value : values) {
             if (ext == value) {
                 return true;
@@ -146,37 +187,23 @@ uint64_t BigFileThresholdBytes(const std::string& path) {
         return 100 * kMb;
     }
     if (isOneOf({"mp4", "avi", "mov", "mkv", "wmv", "flv", "m4v", "3gp",
-                 "mpeg", "mpg", "ts", "webm", "rmvb", "vob", "dv", "swf"})) {
-        return 20 * kMb;
-    }
-    if (isOneOf({"tmp"})) {
+                 "mpeg", "mpg", "ts", "webm", "rmvb", "vob", "dv", "swf",
+                 "tmp"})) {
         return 20 * kMb;
     }
     if (isOneOf({"mp3", "ape", "wav", "flac", "aac", "ogg", "m4a", "ac3",
-                 "dts", "mka", "opus", "wma", "mid"})) {
-        return 5 * kMb;
-    }
-    if (isOneOf({"zip", "rar", "7z", "gz", "iso", "img", "tar", "bz2", "xz",
-                 "cab", "fzip", "rar4"})) {
-        return 5 * kMb;
-    }
-    if (isOneOf({"apk", "ipa", "ipsw"})) {
-        return 5 * kMb;
-    }
-    if (isOneOf({"pack", "wim", "pima", "lib", "pdb", "rb", "torrent"})) {
+                 "dts", "mka", "opus", "wma", "mid", "zip", "rar", "7z",
+                 "gz", "iso", "img", "tar", "bz2", "xz", "cab", "fzip",
+                 "rar4", "apk", "ipa", "ipsw", "pack", "wim", "pima", "lib",
+                 "pdb", "rb", "torrent"})) {
         return 5 * kMb;
     }
     if (isOneOf({"jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp",
-                 "heic", "ico", "raw", "psd", "svg"})) {
-        return 2 * kMb;
-    }
-    if (isOneOf({"txt", "csv", "pdf", "doc", "docx", "xls", "xlsx", "ppt",
-                 "pptx", "odf", "wps", "wpt", "dot", "dotx", "docm", "xlsm",
-                 "rtf", "odt", "dwg", "dxf", "md", "et", "dps", "ofd", "xmind",
-                 "vsdx"})) {
-        return 2 * kMb;
-    }
-    if (isOneOf({"log", "xlog", "dump", "dmp", "lg", "tlg", "ttd", "xltd"})) {
+                 "heic", "ico", "raw", "psd", "svg", "txt", "csv", "pdf",
+                 "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odf", "wps",
+                 "wpt", "dot", "dotx", "docm", "xlsm", "rtf", "odt", "dwg",
+                 "dxf", "md", "et", "dps", "ofd", "xmind", "vsdx", "log",
+                 "xlog", "dump", "dmp", "lg", "tlg", "ttd", "xltd"})) {
         return 2 * kMb;
     }
     return 50 * kMb;
@@ -186,21 +213,17 @@ Json ScanBig(const std::vector<std::string>& drives) {
     scanstate::Begin("big", "大文件扫描");
     const std::vector<std::string> list =
         drives.empty() ? disk::FixedDrives() : drives;
-    const std::vector<mft::FileEntry> found = ScanDrivesPerPhysicalDisk(list);
+    std::vector<mft::FileEntry> found = ScanDrivesPerPhysicalDisk(list);
 
     std::vector<BigFile> rows;
     rows.reserve(found.size());
-    for (const mft::FileEntry& entry : found) {
-        if (IsSystemFileName(entry.path)) {
-            continue;
-        }
-        if (entry.size < BigFileThresholdBytes(entry.path)) {
-            continue;
-        }
+    for (mft::FileEntry& entry : found) {
+        // 谓词已过滤系统文件并保证 size 达标，这里不再重复解析扩展名。
         BigFile row;
-        row.path = entry.path;
         row.size = entry.size;
-        row.mtime = entry.mtime != 0 ? entry.mtime : FileMtimeSeconds(entry.path);
+        row.mtime =
+            entry.mtime != 0 ? entry.mtime : FileMtimeSeconds(entry.path);
+        row.path = std::move(entry.path);
         rows.push_back(std::move(row));
     }
     std::sort(rows.begin(), rows.end(),

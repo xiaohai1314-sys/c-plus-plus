@@ -4,12 +4,39 @@
 #include <winioctl.h>
 
 #include <cctype>
+#include <mutex>
 #include <string>
 
 #include "util/utf.h"
 #include "util/win32.h"
 
 namespace {
+
+struct DriveCache {
+    bool checkedFixed = false;
+    bool isFixed = false;
+    bool queriedSsd = false;
+    std::optional<bool> isSsd;
+    bool queriedPhysical = false;
+    std::optional<std::pair<uint32_t, uint32_t>> physicalId;
+};
+
+std::mutex g_driveCacheMutex;
+DriveCache g_driveCache[26];
+
+bool IsFixedDriveLetter(wchar_t letter) {
+    const size_t idx = static_cast<size_t>(letter - L'A');
+    if (idx >= 26) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+    if (!g_driveCache[idx].checkedFixed) {
+        const wchar_t root[] = {letter, L':', L'\\', L'\0'};
+        g_driveCache[idx].isFixed = (GetDriveTypeW(root) == DRIVE_FIXED);
+        g_driveCache[idx].checkedFixed = true;
+    }
+    return g_driveCache[idx].isFixed;
+}
 
 std::optional<wchar_t> DriveLetter(const std::string& drive) {
     size_t index = 0;
@@ -43,8 +70,21 @@ std::optional<bool> IsSsd(const std::string& drive) {
     if (!letter.has_value()) {
         return std::nullopt;
     }
+    const bool isFixed = (*letter >= L'A' && *letter <= L'Z') && IsFixedDriveLetter(*letter);
+    const size_t idx = static_cast<size_t>(*letter - L'A');
+    if (isFixed) {
+        std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+        if (g_driveCache[idx].queriedSsd) {
+            return g_driveCache[idx].isSsd;
+        }
+    }
     UniqueHandle handle = OpenVolume(*letter);
     if (!handle) {
+        if (isFixed) {
+            std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+            g_driveCache[idx].queriedSsd = true;
+            g_driveCache[idx].isSsd = std::nullopt;
+        }
         return std::nullopt;
     }
     STORAGE_PROPERTY_QUERY query = {};
@@ -52,12 +92,18 @@ std::optional<bool> IsSsd(const std::string& drive) {
     query.QueryType = PropertyStandardQuery;
     DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor = {};
     DWORD returned = 0;
+    std::optional<bool> result;
     if (DeviceIoControl(handle.get(), IOCTL_STORAGE_QUERY_PROPERTY, &query,
                         sizeof(query), &descriptor, sizeof(descriptor),
-                        &returned, nullptr) == 0) {
-        return std::nullopt;
+                        &returned, nullptr) != 0) {
+        result = (descriptor.IncursSeekPenalty == 0);
     }
-    return descriptor.IncursSeekPenalty == 0;
+    if (isFixed) {
+        std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+        g_driveCache[idx].queriedSsd = true;
+        g_driveCache[idx].isSsd = result;
+    }
+    return result;
 }
 
 std::optional<std::pair<uint32_t, uint32_t>> PhysicalDiskId(
@@ -66,18 +112,37 @@ std::optional<std::pair<uint32_t, uint32_t>> PhysicalDiskId(
     if (!letter.has_value()) {
         return std::nullopt;
     }
+    const bool isFixed = (*letter >= L'A' && *letter <= L'Z') && IsFixedDriveLetter(*letter);
+    const size_t idx = static_cast<size_t>(*letter - L'A');
+    if (isFixed) {
+        std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+        if (g_driveCache[idx].queriedPhysical) {
+            return g_driveCache[idx].physicalId;
+        }
+    }
     UniqueHandle handle = OpenVolume(*letter);
     if (!handle) {
+        if (isFixed) {
+            std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+            g_driveCache[idx].queriedPhysical = true;
+            g_driveCache[idx].physicalId = std::nullopt;
+        }
         return std::nullopt;
     }
     STORAGE_DEVICE_NUMBER info = {};
     DWORD returned = 0;
+    std::optional<std::pair<uint32_t, uint32_t>> result;
     if (DeviceIoControl(handle.get(), IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
-                        &info, sizeof(info), &returned, nullptr) == 0) {
-        return std::nullopt;
+                        &info, sizeof(info), &returned, nullptr) != 0) {
+        result = std::make_pair(static_cast<uint32_t>(info.DeviceType),
+                                static_cast<uint32_t>(info.DeviceNumber));
     }
-    return std::make_pair(static_cast<uint32_t>(info.DeviceType),
-                          static_cast<uint32_t>(info.DeviceNumber));
+    if (isFixed) {
+        std::lock_guard<std::mutex> lock(g_driveCacheMutex);
+        g_driveCache[idx].queriedPhysical = true;
+        g_driveCache[idx].physicalId = result;
+    }
+    return result;
 }
 
 std::vector<std::string> FixedDrives() {

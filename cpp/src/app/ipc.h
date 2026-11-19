@@ -26,5 +26,5 @@ private:
     WebViewHost* host_ = nullptr;
     ThreadPool pool_{8};
     std::mutex replyMutex_;
-    std::vector<Json> replies_;
+    std::vector<std::wstring> replies_;
 };
