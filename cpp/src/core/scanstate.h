@@ -15,6 +15,8 @@ struct Status {
     uint64_t done = 0;
     uint64_t total = 0;
     uint64_t found = 0;
+    /// 重复文件扫描的临时分组（4KB 判据），供前端提前上屏。
+    Json partial;
 };
 
 void Begin(const std::string& kind, const std::string& stage);
@@ -30,6 +32,9 @@ void Reset(const std::string& kind, uint64_t total);
 void AddTotal(const std::string& kind, uint64_t delta);
 void Advance(const std::string& kind, uint64_t delta = 1);
 void AddFound(const std::string& kind, uint64_t delta = 1);
+/// 临时分组：扫描过程中可多次追加，Begin/End 时自动清空。
+void AppendPartial(const std::string& kind, Json groups);
+void ClearPartial(const std::string& kind);
 Json StatusJson();
 
 }  // namespace scanstate

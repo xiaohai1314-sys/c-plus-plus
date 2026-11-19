@@ -384,6 +384,8 @@ struct DupGroup {
     std::vector<uint64_t> mtimes;
 };
 
+Json GroupsToJson(const std::vector<DupGroup>& groups);
+
 void BuildDupGroups(GroupMap byHash, std::vector<DupGroup>& groups,
                     bool verbose = false) {
     std::vector<GroupMap::value_type> candidates;
@@ -964,6 +966,7 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
     }
 
     std::vector<DupCandidate> stage2Items;
+    std::vector<DupGroup> headGroups;
     for (auto& entry : byHead) {
         std::vector<DupCandidate>& group = entry.second;
         std::vector<DupCandidate> kept;
@@ -977,6 +980,16 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
             kept.push_back(std::move(item));
         }
         if (kept.size() >= 2) {
+            DupGroup preview;
+            preview.digest = entry.first.digest;
+            preview.size = entry.first.size;
+            preview.files.reserve(kept.size());
+            preview.mtimes.reserve(kept.size());
+            for (const DupCandidate& item : kept) {
+                preview.files.push_back(item.path);
+                preview.mtimes.push_back(item.mtime);
+            }
+            headGroups.push_back(std::move(preview));
             for (DupCandidate& item : kept) {
                 stage2Items.push_back(std::move(item));
             }
@@ -988,9 +1001,13 @@ PipelineOutput RunDupPipeline(std::vector<DupCandidate> stage1Items, bool fast,
         }
     }
 
+    // 4KB 判据的临时分组：先让前端出结果，精算完成后整体替换。
+    scanstate::AppendPartial("dup", GroupsToJson(headGroups));
+
     if (trace) {
-        std::fprintf(stderr, "dup[%s]: 4KB 初筛后剩余 %zu 个文件\n", label,
-                     stage2Items.size());
+        std::fprintf(stderr,
+                     "dup[%s]: 4KB 初筛后剩余 %zu 个文件，临时分组 %zu 组\n",
+                     label, stage2Items.size(), headGroups.size());
     }
     if (stage2Items.empty()) {
         return output;

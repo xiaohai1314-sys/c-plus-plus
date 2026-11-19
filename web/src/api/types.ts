@@ -73,6 +73,8 @@ export interface ScanStatus {
   done: number;
   total: number;
   found: number;
+  /** 重复文件扫描的临时分组（4KB 判据），精算完成后会被正式结果替换。 */
+  partial?: DupGroup[];
 }
 
 export interface TaskStatus {

@@ -40,3 +40,31 @@ TEST(scanstate_lifecycle_and_cancel) {
     CHECK(scanstate::WasCancelled("dup"));
     scanstate::End("dup");
 }
+
+TEST(scanstate_partial_groups_feed_the_status) {
+    Json first = Json::array();
+    first.push_back(Json{{"hash", "aa"}, {"size", 10}});
+    Json second = Json::array();
+    second.push_back(Json{{"hash", "bb"}, {"size", 20}});
+
+    scanstate::Begin("dup", "初步筛选");
+    scanstate::AppendPartial("dup", first);
+    Json status = scanstate::StatusJson();
+    CHECK(status["dup"].contains("partial"));
+    CHECK_EQ(status["dup"]["partial"].size(), static_cast<size_t>(1));
+
+    scanstate::AppendPartial("dup", second);
+    status = scanstate::StatusJson();
+    CHECK_EQ(status["dup"]["partial"].size(), static_cast<size_t>(2));
+
+    // 结束扫描后清空，避免下一次轮询把旧结果重新上屏。
+    scanstate::End("dup");
+    CHECK(!scanstate::StatusJson()["dup"].contains("partial"));
+
+    // 新一轮扫描开始时也清空。
+    scanstate::Begin("dup", "初步筛选");
+    scanstate::AppendPartial("dup", first);
+    scanstate::Begin("dup", "初步筛选");
+    CHECK(!scanstate::StatusJson()["dup"].contains("partial"));
+    scanstate::End("dup");
+}

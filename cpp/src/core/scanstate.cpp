@@ -17,6 +17,8 @@ struct AtomicStatus {
     std::atomic<uint64_t> found{0};
     mutable std::mutex stageMutex;
     std::string stage;
+    mutable std::mutex partialMutex;
+    Json partial;
 
     void SetStage(std::string s) {
         std::lock_guard<std::mutex> lock(stageMutex);
@@ -36,6 +38,10 @@ struct AtomicStatus {
         s.total = total.load(std::memory_order_relaxed);
         s.found = found.load(std::memory_order_relaxed);
         s.stage = GetStage();
+        {
+            std::lock_guard<std::mutex> lock(partialMutex);
+            s.partial = partial;
+        }
         return s;
     }
 };
@@ -96,6 +102,7 @@ void Begin(const std::string& kind, const std::string& stage) {
     entry->total.store(0, std::memory_order_relaxed);
     entry->found.store(0, std::memory_order_relaxed);
     entry->SetStage(stage);
+    ClearPartial(kind);
     entry->active.store(true, std::memory_order_release);
 }
 
@@ -103,6 +110,7 @@ void End(const std::string& kind) {
     AtomicStatus* entry = FindExistingEntry(kind);
     if (entry != nullptr) {
         entry->active.store(false, std::memory_order_release);
+        ClearPartial(kind);
     }
 }
 
@@ -192,6 +200,29 @@ void AddFound(const std::string& kind, uint64_t delta) {
     entry->found.fetch_add(delta, std::memory_order_relaxed);
 }
 
+void AppendPartial(const std::string& kind, Json groups) {
+    if (!groups.is_array() || groups.empty()) {
+        return;
+    }
+    AtomicStatus* entry = GetOrCreateEntry(kind);
+    std::lock_guard<std::mutex> lock(entry->partialMutex);
+    if (!entry->partial.is_array()) {
+        entry->partial = Json::array();
+    }
+    for (Json& group : groups) {
+        entry->partial.push_back(std::move(group));
+    }
+}
+
+void ClearPartial(const std::string& kind) {
+    AtomicStatus* entry = FindExistingEntry(kind);
+    if (entry == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(entry->partialMutex);
+    entry->partial = Json::array();
+}
+
 Json StatusJson() {
     std::vector<std::string> kinds;
     {
@@ -210,6 +241,9 @@ Json StatusJson() {
             item["done"] = s.done;
             item["total"] = s.total;
             item["found"] = s.found;
+            if (!s.partial.empty()) {
+                item["partial"] = std::move(s.partial);
+            }
             result[kind] = std::move(item);
         }
     }

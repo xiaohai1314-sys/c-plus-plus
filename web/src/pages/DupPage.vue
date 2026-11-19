@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, watch } from "vue";
 import { invoke } from "../api/tauri";
 import type { DeleteReport, DupGroup } from "../api/types";
 import { showConfirm } from "../composables/useModal";
@@ -62,6 +62,9 @@ const driveOptions = computed(() => (drives.value.length ? drives.value : ["C:\\
 /** 每次切换页签自增；异步结果回来时对不上就丢弃，避免旧页签覆盖新页签。 */
 let scopeToken = 0;
 let cancelRequested = false;
+/** 当前列表是否来自 4KB 临时分组（而不是缓存或正式结果）。 */
+let showingPartial = false;
+let lastPartialCount = -1;
 
 function selectScope(scope: DupScope) {
   if (dupScope.value === scope) return;
@@ -174,6 +177,8 @@ async function scanArgs(): Promise<DupScanArgs | null> {
 
 async function scan(token = ++scopeToken) {
   dupLoading.value = true;
+  showingPartial = false;
+  lastPartialCount = -1;
   startScanStatus();
   try {
     const args = await scanArgs();
@@ -187,6 +192,7 @@ async function scan(token = ++scopeToken) {
       const previous = new Set(dupChecked);
       dupGroups.value = groups;
       dupCachedAt.value = Math.floor(Date.now() / 1000);
+      showingPartial = false;
       if (!restoreSelection(groups, previous)) selectDefaults();
     }
   } catch (error) {
@@ -261,6 +267,22 @@ async function removeSelected() {
     toast("清理失败：" + error);
   }
 }
+
+// 4KB 临时分组先上屏。只在列表为空时接管，避免用不精确的结果覆盖上次
+// 扫描的准确结果；一旦接管，后续追加的批次继续刷新。
+watch(
+  () => scanStatus.value?.dup?.partial,
+  (partial) => {
+    if (!dupLoading.value || !partial || !partial.length) return;
+    if (dupGroups.value.length && !showingPartial) return;
+    // 每次轮询都是新对象，按数量去重，避免每 500ms 重绘整个列表。
+    if (partial.length === lastPartialCount) return;
+    lastPartialCount = partial.length;
+    dupGroups.value = partial;
+    dupCachedAt.value = 0;
+    showingPartial = true;
+  },
+);
 
 onMounted(async () => {
   if (dupGroups.value.length || dupLoading.value || dupScope.value === "PICK") return;
