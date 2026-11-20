@@ -73,6 +73,21 @@ std::string LowerAscii(std::string text) {
     return text;
 }
 
+/// 程序文件和构建产物：删掉其中一份容易破坏程序，默认不参与查重。
+bool IsProgramArtifact(const std::string& path) {
+    static const std::unordered_set<std::string> exts = {
+        "dll", "sys", "ocx", "drv", "so", "dylib", "lib", "a",  "o",
+        "obj", "pdb", "ilk", "exp", "js", "mjs",    "cjs", "ts", "map"};
+    const size_t slash = path.find_last_of("\\/");
+    const std::string name =
+        slash == std::string::npos ? path : path.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= name.size()) {
+        return false;
+    }
+    return exts.count(LowerAscii(name.substr(dot + 1))) != 0;
+}
+
 bool EqualsIgnoreCase(const std::string& left, const std::string& right) {
     return LowerAscii(left) == LowerAscii(right);
 }
@@ -266,7 +281,7 @@ std::vector<std::vector<mft::FileEntry>> ScanDrivesPerPhysicalDisk(
         std::vector<mft::FileEntry> files = mft::ScanFilesWhere(
             root, minSize, SkipTop(),
             [](const std::string& name, uint64_t) {
-                return !IsSystemFileName(name);
+                return !IsSystemFileName(name) && !IsProgramArtifact(name);
             });
         const uint64_t done = enumerated.fetch_add(1) + 1;
         std::string label = root;
